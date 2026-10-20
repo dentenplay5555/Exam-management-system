@@ -44,12 +44,16 @@ async function getCryptoKey(secret: string): Promise<CryptoKey> {
 }
 
 // Sign session into tamper-proof token: <header>.<payload>.<signature>
-export async function signSession(user: Omit<UserSession, 'iat' | 'exp'>, secret: string): Promise<string> {
+export async function signSession(
+  user: Omit<UserSession, 'iat' | 'exp'>,
+  secret: string,
+  ttlSeconds: number = 86400 * 7
+): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const payload: UserSession = {
     ...user,
     iat: now,
-    exp: now + 86400 * 7 // 7 days
+    exp: now + ttlSeconds
   };
 
   const enc = new TextEncoder();
@@ -84,7 +88,10 @@ export async function verifySession(token: string, secret: string): Promise<User
 
     // Check expiration
     const now = Math.floor(Date.now() / 1000);
-    if (payload.exp && payload.exp < now) {
+    if (typeof payload.exp !== 'number' || payload.exp < now) {
+      return null;
+    }
+    if (!payload.id || !payload.email || !['student', 'teacher', 'dev'].includes(payload.role)) {
       return null;
     }
 

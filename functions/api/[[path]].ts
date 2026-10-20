@@ -38,13 +38,16 @@ export interface Env {
   GOOGLE_CLIENT_SECRET?: string;
   DEV_EMAILS?: string;
   TEACHER_EMAILS?: string;
+  TEACHER_CLASSES?: string;
 }
 
-// Default fallback secret for development if not configured
-const DEFAULT_DEV_SECRET = 'prism-hub-nssc-super-secret-key-32b';
-
-function getSessionSecret(env: Env): string {
-  return env.SESSION_SECRET || DEFAULT_DEV_SECRET;
+// Fail-closed session secret: No hardcoded fallback! Must be >= 32 characters
+function getSessionSecret(env: Env): string | null {
+  const secret = (env.SESSION_SECRET || '').trim();
+  if (secret.length < 32) {
+    return null;
+  }
+  return secret;
 }
 
 function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -90,7 +93,22 @@ async function querySupabase(env: Env, endpoint: string): Promise<any[] | null> 
   return null;
 }
 
+// Helper to resolve teacher classes from TEACHER_CLASSES env or default to all 9 classes (ม.3/1 – ม.3/9)
+function resolveTeacherClasses(env: Env, email: string): string[] {
+  if (env.TEACHER_CLASSES) {
+    const pairs = env.TEACHER_CLASSES.split('|');
+    for (const pair of pairs) {
+      const [em, classesStr] = pair.split(':');
+      if (em && classesStr && em.trim().toLowerCase() === email.toLowerCase()) {
+        return classesStr.split(',').map(c => c.trim()).filter(Boolean);
+      }
+    }
+  }
+  return Array.from({ length: 9 }, (_, i) => `ม.3/${i + 1}`);
+}
+
 // Helper to extract student row from writing_assessment_final
+// Prioritizes actual view column names: full_name, class_number, student_id
 function normalizeStudentRow(r: any, idx = 0) {
   const scores: SkillScores = {
     TR: Number(r.tr ?? r.score_tr ?? r.TR ?? 0),
@@ -134,10 +152,10 @@ function normalizeStudentRow(r: any, idx = 0) {
   const level = evaluateLevel(binaryTotal);
 
   return {
-    id: String(r.id || r.student_id || `stu-${idx + 1}`),
-    name: String(r.name || r.student_name || `นักเรียนคนที่ ${idx + 1}`),
-    class: String(r.class || r.classroom || 'ม.3/1'),
-    no: Number(r.no || r.student_number || idx + 1),
+    id: String(r.student_id ?? r.id ?? `stu-${idx + 1}`),
+    name: String(r.full_name ?? r.name ?? r.student_name ?? `นักเรียนคนที่ ${idx + 1}`),
+    class: String(r.class ?? r.classroom ?? 'ม.3/1'),
+    no: Number(r.class_number ?? r.no ?? r.student_number ?? (idx + 1)),
     scores,
     rubricTotal,
     binary,
@@ -171,11 +189,18 @@ export const onRequest = async (context: {
   // 1. Auth: GET /api/auth/google/start (OAuth Start)
   // ----------------------------------------------------
   if (path === 'auth/google/start') {
-    // Fail-closed check: No auto-login! If OAuth is unconfigured, return 500 error.
+    // Fail-closed check: No auto-login! If OAuth or SESSION_SECRET is unconfigured, return 500 error.
     if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
       return errorResponse(
         'CONFIG_ERROR',
         'Google OAuth ยังไม่ได้ตั้งค่าบนเซิร์ฟเวอร์ กรุณาตั้งค่า GOOGLE_CLIENT_ID และ GOOGLE_CLIENT_SECRET ใน Environment Variables',
+        500
+      );
+    }
+    if (!secret) {
+      return errorResponse(
+        'CONFIG_ERROR',
+        'เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า SESSION_SECRET หรือคีย์สั้นกว่า 32 ตัวอักษร กรุณาตั้งค่าใน Cloudflare Pages Environment Variables ก่อนเริ่มใช้งาน',
         500
       );
     }
@@ -199,6 +224,14 @@ export const onRequest = async (context: {
   // 2. Auth: GET /api/auth/google/callback (OAuth Callback)
   // ----------------------------------------------------
   if (path === 'auth/google/callback') {
+    if (!secret) {
+      return errorResponse(
+        'CONFIG_ERROR',
+        'เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า SESSION_SECRET หรือคีย์สั้นกว่า 32 ตัวอักษร กรุณาตั้งค่าใน Environment Variables',
+        500
+      );
+    }
+
     const code = url.searchParams.get('code');
     const returnedState = url.searchParams.get('state');
     const expectedState = cookies['oauth_state'];
@@ -257,13 +290,13 @@ export const onRequest = async (context: {
         );
       }
 
-      // Determine Role strictly from verified lists (NEVER substring guessing)
-      const devEmails = (env.DEV_EMAILS || 'admin@nssc.ac.th')
+      // Determine Role strictly from env whitelists (empty array if unset - NO HARDCODED EMAILS!)
+      const devEmails = (env.DEV_EMAILS || '')
         .split(',')
         .map(e => e.trim().toLowerCase())
         .filter(Boolean);
 
-      const teacherEmails = (env.TEACHER_EMAILS || 'somkiat.y@nssc.ac.th')
+      const teacherEmails = (env.TEACHER_EMAILS || '')
         .split(',')
         .map(e => e.trim().toLowerCase())
         .filter(Boolean);
@@ -275,7 +308,7 @@ export const onRequest = async (context: {
         role = 'dev';
       } else if (teacherEmails.includes(email)) {
         role = 'teacher';
-        teacherClasses = ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4'];
+        teacherClasses = resolveTeacherClasses(env, email);
       }
 
       const sessionUser: UserSession = {
@@ -291,12 +324,21 @@ export const onRequest = async (context: {
       const secureFlag = isHttps ? 'Secure; ' : '';
       const targetUrl = role === 'student' ? '/student' : role === 'teacher' ? '/teacher' : '/dev/exercises';
 
+      const responseHeaders = new Headers();
+      responseHeaders.set('Location', targetUrl);
+      responseHeaders.append(
+        'Set-Cookie',
+        `practice_hub_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; ${secureFlag}Max-Age=604800`
+      );
+      // Clean up oauth_state cookie after successful verification
+      responseHeaders.append(
+        'Set-Cookie',
+        `oauth_state=; Path=/; HttpOnly; SameSite=Lax; ${secureFlag}Max-Age=0`
+      );
+
       return new Response(null, {
         status: 302,
-        headers: {
-          'Location': targetUrl,
-          'Set-Cookie': `practice_hub_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; ${secureFlag}Max-Age=604800`
-        }
+        headers: responseHeaders
       });
     } catch (e: any) {
       console.error('OAuth callback error:', e);
@@ -317,6 +359,14 @@ export const onRequest = async (context: {
   // ----------------------------------------------------
   // 4. GET /api/me (Session Check)
   // ----------------------------------------------------
+  if (!secret) {
+    return errorResponse(
+      'CONFIG_ERROR',
+      'เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า SESSION_SECRET หรือคีย์สั้นกว่า 32 ตัวอักษร กรุณาตั้งค่าใน Cloudflare Pages Environment Variables',
+      500
+    );
+  }
+
   const rawSession = cookies['practice_hub_session'];
   const currentUser: UserSession | null = rawSession ? await verifySession(rawSession, secret) : null;
 
@@ -344,15 +394,36 @@ export const onRequest = async (context: {
   // 5. GET /api/student/exercises
   // ----------------------------------------------------
   if (path === 'student/exercises') {
+    // Check real pretest status for this student
+    let isPretestCompleted = false;
+    try {
+      const emailMapping = await querySupabase(
+        env,
+        `student_emails?email=eq.${encodeURIComponent(currentUser.email)}&select=student_id`
+      );
+      if (emailMapping && emailMapping.length > 0 && emailMapping[0].student_id) {
+        const studentId = emailMapping[0].student_id;
+        const res = await querySupabase(
+          env,
+          `writing_assessment_final?student_id=eq.${encodeURIComponent(studentId)}&select=student_id`
+        );
+        if (res && res.length > 0) {
+          isPretestCompleted = true;
+        }
+      }
+    } catch {
+      // If student_emails not queried, remains false
+    }
+
     const exercises: StudentExerciseItem[] = [
       {
         id: 'prism-fanboys-pretest',
         name: 'PRISM · FANBOYS · Pretest',
         series: 'FANBOYS Series',
         phase: 'Pretest',
-        status: 'COMPLETED',
+        status: isPretestCompleted ? 'COMPLETED' : 'TODO',
         dueAt: '2026-10-31T23:59:59Z',
-        attemptsUsed: 1,
+        attemptsUsed: isPretestCompleted ? 1 : 0,
         maxAttempts: 1,
         exerciseUrl: 'https://prism-fanboys.pages.dev'
       },
@@ -361,7 +432,7 @@ export const onRequest = async (context: {
         name: 'PRISM · FANBOYS · Cycle 1',
         series: 'FANBOYS Series',
         phase: 'Cycle 1',
-        status: 'IN_PROGRESS',
+        status: 'TODO',
         dueAt: '2026-11-07T23:59:59Z',
         attemptsUsed: 0,
         maxAttempts: 1,
@@ -399,63 +470,41 @@ export const onRequest = async (context: {
   // ----------------------------------------------------
   if (path.startsWith('student/results/')) {
     const exId = path.split('/')[2];
-    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
 
-    if (!sbRows || sbRows.length === 0) {
-      return errorResponse('NOT_FOUND', 'ไม่พบข้อมูลผลการประเมินของผู้เรียนในระบบ', 404);
+    // 1. Single source of truth for email -> student_id mapping: student_emails table
+    const emailMapping = await querySupabase(
+      env,
+      `student_emails?email=eq.${encodeURIComponent(currentUser.email)}&select=student_id`
+    );
+
+    let studentId: string | null = null;
+    if (emailMapping && emailMapping.length > 0 && emailMapping[0].student_id) {
+      studentId = String(emailMapping[0].student_id);
     }
 
-    // Match student via PEM roster or direct mapping
-    let matchedRow = null;
-
-    // 1. Check if Supabase has a PEM roster or student mapping table
-    try {
-      const rosterTables = ['pem_roster', 'student_roster', 'students'];
-      for (const table of rosterTables) {
-        const rosterRows = await querySupabase(env, `${table}?email=eq.${encodeURIComponent(currentUser.email)}`);
-        if (rosterRows && rosterRows.length > 0) {
-          const roster = rosterRows[0];
-          const studentId = roster.student_id || roster.id || roster.code;
-          const studentName = roster.name || roster.full_name;
-          const studentClass = roster.class || roster.classroom;
-          const studentNo = roster.no || roster.student_number;
-
-          matchedRow = sbRows.find((r: any) => {
-            if (studentId && (String(r.id) === String(studentId) || String(r.student_id) === String(studentId))) return true;
-            if (studentName && (r.name === studentName || r.student_name === studentName)) return true;
-            if (studentClass && studentNo && String(r.class || r.classroom) === String(studentClass) && Number(r.no || r.student_number) === Number(studentNo)) return true;
-            return false;
-          });
-          if (matchedRow) break;
-        }
-      }
-    } catch {
-      // Continue to direct column matching if roster table is not yet created
-    }
-
-    // 2. Direct column matching on writing_assessment_final
-    if (!matchedRow) {
-      const emailPrefixMatch = currentUser.email.match(/^(\d{5})/);
-      const studentIdFromEmail = emailPrefixMatch ? emailPrefixMatch[1] : null;
-
-      matchedRow = sbRows.find((r: any) => {
-        if (r.email && r.email.toLowerCase() === currentUser.email.toLowerCase()) return true;
-        if (r.student_email && r.student_email.toLowerCase() === currentUser.email.toLowerCase()) return true;
-        if (studentIdFromEmail && (String(r.id) === studentIdFromEmail || String(r.student_id) === studentIdFromEmail)) return true;
-        return false;
-      });
-    }
-
-    // Strictly return 404 if no real record found for student (no fake fallback!)
-    if (!matchedRow) {
+    if (!studentId) {
       return errorResponse(
-        'NOT_FOUND',
-        `ไม่พบข้อมูลผลการประเมินสำหรับบัญชี ${currentUser.email} กรุณาตรวจสอบว่าท่านได้ส่งแบบฝึกหัดแล้วหรือยัง หรือติดต่อผู้ดูแลระบบ`,
+        'STUDENT_NOT_LINKED',
+        `ไม่พบบัญชีอีเมล ${currentUser.email} ในระบบลงทะเบียน student_emails กรุณาติดต่อครูผู้สอนเพื่อนำเข้าข้อมูล PEM`,
         404
       );
     }
 
-    const norm = normalizeStudentRow(matchedRow);
+    // 2. Query writing_assessment_final with student_id filter directly at PostgREST
+    const sbRows = await querySupabase(
+      env,
+      `writing_assessment_final?student_id=eq.${encodeURIComponent(studentId)}&select=*`
+    );
+
+    if (!sbRows || sbRows.length === 0) {
+      return errorResponse(
+        'SUBMISSION_NOT_FOUND',
+        `พบข้อมูลผู้เรียนในระบบแล้ว แต่ยังไม่พบผลการประเมินแบบฝึกหัดชุดนี้ กรุณาตรวจสอบว่าท่านได้ส่งแบบฝึกหัดแล้วหรือยัง`,
+        404
+      );
+    }
+
+    const norm = normalizeStudentRow(sbRows[0]);
 
     const payload: StudentResultPayload = {
       exercise: {
@@ -497,7 +546,7 @@ export const onRequest = async (context: {
 
     const classes = currentUser.classes?.length
       ? currentUser.classes
-      : ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4'];
+      : Array.from({ length: 9 }, (_, i) => `ม.3/${i + 1}`);
 
     return jsonResponse(classes);
   }
@@ -519,28 +568,28 @@ export const onRequest = async (context: {
       return errorResponse('FORBIDDEN', `คุณไม่มีสิทธิ์เข้าถึงข้อมูลของห้อง ${classId}`, 403);
     }
 
-    // Query Supabase writing_assessment_final
-    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
-    if (!sbRows || sbRows.length === 0) {
+    // Filter at PostgREST directly (support both "ม.3/1" and "3/1" conventions)
+    const cleanClass = classId.replace(/^ม\./, '');
+    const classRows = await querySupabase(
+      env,
+      `writing_assessment_final?or=(class.eq.${encodeURIComponent(classId)},class.eq.${encodeURIComponent(cleanClass)})&select=*`
+    );
+
+    if (!classRows || classRows.length === 0) {
       return errorResponse('NOT_FOUND', `ไม่พบข้อมูลการประเมินสำหรับห้อง ${classId}`, 404);
     }
 
-    // Filter students by class
-    const classRows = sbRows.filter((r: any) => {
-      const c = String(r.class || r.classroom || '').trim();
-      return c === classId || c === classId.replace('ม.', '');
-    });
-
-    if (classRows.length === 0) {
-      return errorResponse('NOT_FOUND', `ไม่พบรายชื่อนักเรียนที่มีผลการประเมินในห้อง ${classId}`, 404);
-    }
-
-    // Normalize each student
+    // Normalize each student with correct full_name, class_number, student_id
     const evaluatedList = classRows.map((r, i) => normalizeStudentRow(r, i));
     const submittedCount = evaluatedList.length;
+
+    // Dynamically retrieve total students from students table if accessible, otherwise submittedCount
     let totalStudents = submittedCount;
     try {
-      const rosterRows = await querySupabase(env, `student_roster?class=eq.${encodeURIComponent(classId)}`);
+      const rosterRows = await querySupabase(
+        env,
+        `students?or=(class.eq.${encodeURIComponent(classId)},class.eq.${encodeURIComponent(cleanClass)})&select=id`
+      );
       if (rosterRows && rosterRows.length > 0) {
         totalStudents = rosterRows.length;
       }
@@ -691,17 +740,42 @@ export const onRequest = async (context: {
       return errorResponse('FORBIDDEN', `คุณไม่มีสิทธิ์เข้าถึงข้อมูลของห้อง ${classId}`, 403);
     }
 
-    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
+    const cleanClass = classId.replace(/^ม\./, '');
+    const sbRows = await querySupabase(
+      env,
+      `writing_assessment_final?or=(class.eq.${encodeURIComponent(classId)},class.eq.${encodeURIComponent(cleanClass)})&select=*`
+    );
+
     if (!sbRows || sbRows.length === 0) {
       return errorResponse('NOT_FOUND', `ไม่พบข้อมูลสำหรับห้อง ${classId}`, 404);
     }
 
-    const classRows = sbRows.filter((r: any) => {
-      const c = String(r.class || r.classroom || '').trim();
-      return c === classId || c === classId.replace('ม.', '');
-    });
+    // Attempt to query all students in this class from students table to detect NOT_STARTED
+    let unsubmittedList: TeacherSubmissionStatus[] = [];
+    try {
+      const rosterRows = await querySupabase(
+        env,
+        `students?or=(class.eq.${encodeURIComponent(classId)},class.eq.${encodeURIComponent(cleanClass)})&select=*`
+      );
+      if (rosterRows && rosterRows.length > 0) {
+        const submittedIds = new Set(sbRows.map((r: any) => String(r.student_id || r.id)));
+        unsubmittedList = rosterRows
+          .filter((s: any) => !submittedIds.has(String(s.id || s.student_id)))
+          .map((s: any, i: number) => ({
+            userId: String(s.id || s.student_id || `pending-${i + 1}`),
+            no: Number(s.class_number || s.no || (i + 1)),
+            name: String(s.full_name || s.name || `นักเรียนคนที่ ${i + 1}`),
+            status: 'TODO',
+            partsCompleted: 0,
+            totalParts: 2,
+            lastActivityAt: '-'
+          }));
+      }
+    } catch {
+      // Roster table not accessible
+    }
 
-    const statusList: TeacherSubmissionStatus[] = classRows.map((r, i) => {
+    const submittedList: TeacherSubmissionStatus[] = sbRows.map((r, i) => {
       const norm = normalizeStudentRow(r, i);
       return {
         userId: norm.id,
@@ -714,7 +788,7 @@ export const onRequest = async (context: {
       };
     });
 
-    return jsonResponse(statusList);
+    return jsonResponse([...submittedList, ...unsubmittedList]);
   }
 
   // ----------------------------------------------------
@@ -729,21 +803,17 @@ export const onRequest = async (context: {
     const exId = parts[2];
     const userId = decodeURIComponent(parts[3] || '');
 
-    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
+    // Search strictly by student_id at PostgREST
+    const sbRows = await querySupabase(
+      env,
+      `writing_assessment_final?student_id=eq.${encodeURIComponent(userId)}&select=*`
+    );
+
     if (!sbRows || sbRows.length === 0) {
-      return errorResponse('NOT_FOUND', 'ไม่พบข้อมูลในระบบ', 404);
+      return errorResponse('NOT_FOUND', `ไม่พบข้อมูลผลการประเมินสำหรับนักเรียนรหัส ${userId}`, 404);
     }
 
-    const matchedRow = sbRows.find((r: any, idx: number) => {
-      const id = String(r.id || r.student_id || `stu-${idx + 1}`);
-      return id === userId || String(r.no || r.student_number) === userId;
-    });
-
-    if (!matchedRow) {
-      return errorResponse('NOT_FOUND', `ไม่พบข้อมูลนักเรียนรหัส ${userId} ในห้องเรียน`, 404);
-    }
-
-    const norm = normalizeStudentRow(matchedRow);
+    const norm = normalizeStudentRow(sbRows[0]);
 
     // Verify teacher ownership of this student's class
     if (currentUser.role === 'teacher' && currentUser.classes && !currentUser.classes.includes(norm.class)) {
@@ -790,8 +860,7 @@ export const onRequest = async (context: {
 
     if (path === 'dev/exercises') {
       if (method === 'POST') {
-        const body = (await request.json().catch(() => ({}))) as any;
-        return jsonResponse({ ok: true, id: body.id || 'new-ex', message: 'ลงทะเบียนแบบฝึกสำเร็จ' });
+        return errorResponse('NOT_IMPLEMENTED', 'ฟังก์ชันลงทะเบียนแบบฝึกหัดใหม่ผ่าน Dev API ยังไม่พร้อมใช้งานในระบบเวอร์ชันนี้', 501);
       }
 
       return jsonResponse([
@@ -810,33 +879,15 @@ export const onRequest = async (context: {
     }
 
     if (path === 'dev/sync') {
-      return jsonResponse({
-        ok: true,
-        syncedExercises: 1,
-        totalSubmissionsSynced: 42,
-        durationMs: 280,
-        completedAt: new Date().toISOString()
-      });
+      return errorResponse('NOT_IMPLEMENTED', 'ฟังก์ชันสั่ง Sync แบบแมนนวลผ่าน Dev API ยังไม่พร้อมใช้งานในระบบเวอร์ชันนี้', 501);
     }
 
     if (path === 'dev/logs') {
-      return jsonResponse([
-        {
-          id: 'log-01',
-          exerciseId: 'prism-fanboys-pretest',
-          at: new Date().toISOString(),
-          ok: true,
-          rows: 42,
-          ms: 280
-        }
-      ]);
+      return errorResponse('NOT_IMPLEMENTED', 'ฟังก์ชันระบบ Audit Logs ผ่าน Dev API ยังไม่พร้อมใช้งานในระบบเวอร์ชันนี้', 501);
     }
 
     if (path === 'dev/users') {
-      return jsonResponse([
-        { id: '1', email: 'somkiat.y@nssc.ac.th', name: 'อาจารย์สมเกียรติ ยิ่งเจริญ', role: 'teacher', classes: ['ม.3/1', 'ม.3/2'] },
-        { id: '2', email: 'admin@nssc.ac.th', name: 'System Administrator', role: 'dev', classes: [] }
-      ]);
+      return errorResponse('NOT_IMPLEMENTED', 'ระบบจัดการรายชื่อผู้ใช้ผ่าน Dev API ยังไม่พร้อมใช้งาน กรุณาจัดการผ่าน Supabase Dashboard', 501);
     }
   }
 

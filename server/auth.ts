@@ -110,7 +110,13 @@ export function parseCookies(cookieHeader: string | null): Record<string, string
     if (idx !== -1) {
       const k = item.slice(0, idx).trim();
       const v = item.slice(idx + 1).trim();
-      if (k) cookies[k] = decodeURIComponent(v);
+      if (k) {
+        try {
+          cookies[k] = decodeURIComponent(v);
+        } catch {
+          cookies[k] = v;
+        }
+      }
     }
   }
   return cookies;

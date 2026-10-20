@@ -21,7 +21,8 @@ export const StudentExercisesPage: React.FC<StudentExercisesPageProps> = ({ onSe
     try {
       const data = await studentApi.getExercises();
       // Sort by due date
-      const sorted = [...data].sort((a, b) => new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime());
+      const dueTime = (d: string | null) => (d ? new Date(d).getTime() : Number.POSITIVE_INFINITY);
+      const sorted = [...data].sort((a, b) => dueTime(a.dueAt) - dueTime(b.dueAt));
       setExercises(sorted);
     } catch (err: any) {
       setError(err.message || 'ไม่สามารถโหลดรายการแบบฝึกหัดได้');
@@ -67,11 +68,13 @@ export const StudentExercisesPage: React.FC<StudentExercisesPageProps> = ({ onSe
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 20 }}>
         {exercises.map((ex) => {
           const isSubmitted = ex.status === 'SUBMITTED' || ex.status === 'COMPLETED';
-          const dueDateStr = new Date(ex.dueAt).toLocaleDateString('th-TH', {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric'
-          });
+          const dueDateStr = ex.dueAt
+            ? new Date(ex.dueAt).toLocaleDateString('th-TH', {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric'
+              })
+            : 'ไม่ระบุ';
 
           return (
             <div
@@ -120,22 +123,24 @@ export const StudentExercisesPage: React.FC<StudentExercisesPageProps> = ({ onSe
               {/* Action Buttons */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {/* Single Big Button "ทำต่อ" (Rule 2) */}
-                <a
-                  href={ex.exerciseUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="btn-primary"
-                  style={{
-                    width: '100%',
-                    padding: '12px 20px',
-                    fontSize: 15,
-                    textDecoration: 'none',
-                    borderRadius: 'var(--radius-md)'
-                  }}
-                >
-                  <span>ทำต่อ (เข้าสู่เว็บแบบฝึกหัด)</span>
-                  <ExternalLink size={16} />
-                </a>
+                {ex.exerciseUrl && (
+                  <a
+                    href={ex.exerciseUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="btn-primary"
+                    style={{
+                      width: '100%',
+                      padding: '12px 20px',
+                      fontSize: 15,
+                      textDecoration: 'none',
+                      borderRadius: 'var(--radius-md)'
+                    }}
+                  >
+                    <span>ทำต่อ (เข้าสู่เว็บแบบฝึกหัด)</span>
+                    <ExternalLink size={16} />
+                  </a>
+                )}
 
                 {/* View Result button if already submitted */}
                 {isSubmitted && (

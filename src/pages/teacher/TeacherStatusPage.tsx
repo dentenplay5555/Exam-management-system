@@ -147,7 +147,7 @@ export const TeacherStatusPage: React.FC<TeacherStatusPageProps> = ({ exId, clas
                     </span>
                   </td>
                   <td style={{ padding: '12px 10px', color: 'var(--text-dim)', fontSize: 12 }}>
-                    {s.lastActivityAt}
+                    {s.lastActivityAt ?? '-'}
                   </td>
                 </tr>
               ))}

@@ -1,7 +1,10 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022", "WebWorker"],
+    "lib": [
+      "ES2022",
+      "WebWorker"
+    ],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -16,5 +19,8 @@
     "functions/**/*.ts",
     "server/**/*.ts",
     "src/types/index.ts"
+  ],
+  "exclude": [
+    "server/**/*.test.ts"
   ]
 }

@@ -83,7 +83,7 @@ export interface StudentExerciseItem {
   id: string;
   name: string;
   status: StatusType;
-  dueAt: string;
+  dueAt: string | null;
   attemptsUsed: number;
   maxAttempts: number;
   exerciseUrl: string;
@@ -214,7 +214,7 @@ export interface TeacherSubmissionStatus {
   status: StatusType;
   partsCompleted: number;
   totalParts: number;
-  lastActivityAt: string;
+  lastActivityAt: string | null;
 }
 
 export interface DevExerciseItem {

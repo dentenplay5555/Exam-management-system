@@ -40,9 +40,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       throw new ApiError('FORBIDDEN', 'คุณไม่มีสิทธิ์เข้าถึงส่วนนี้');
     }
 
-    const json = await res.json();
+    const json = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new ApiError(json.error?.code || 'ERROR', json.error?.message || 'เกิดข้อผิดพลาดในการติดต่อระบบ');
+      const code = typeof json.error === 'string'
+        ? json.error
+        : json.error?.code || json.code || 'ERROR';
+      const message = json.message
+        || json.error?.message
+        || (typeof json.error === 'string' ? json.error : 'เกิดข้อผิดพลาดในการติดต่อระบบ');
+      throw new ApiError(code, message);
     }
 
     return json as T;

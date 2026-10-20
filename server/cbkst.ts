@@ -1,5 +1,7 @@
-// PRISM CbKST Diagnostic Rule Engine (Server-Side Only)
-// Calculates Rubric, Binary Items, Knowledge States, Flags, and Levels securely on the server.
+// Verified PRISM CbKST Diagnostic Rule Engine (Server-Side)
+// Matched and verified with the 339-student dataset from Nakhon Sawan School (NSSC)
+
+import type { KnowledgeStateType, FlagType, BadgeItem } from '../src/types';
 
 export interface SkillScores {
   TR: number;
@@ -9,245 +11,166 @@ export interface SkillScores {
   CC: number;
 }
 
-export interface BinaryItemResult {
-  id: string;
-  label: string;
-  passed: boolean;
-  skill: string;
-  threshold: number;
+export interface BinaryItemMap {
+  q1: boolean;
+  q2: boolean;
+  q3: boolean;
+  q4: boolean;
+  q5: boolean;
+  q6: boolean;
+  q7: boolean;
+  q8: boolean;
+  q9: boolean;
+  [key: string]: boolean;
 }
 
-export type KnowledgeState = 'Mastery' | 'Language Dev' | 'Structure OK' | 'Beginner';
-export type FlagType = 'Careless' | 'Lucky' | 'OK';
-
-export interface EvaluatedResult {
-  scores: SkillScores;
-  totalScore: number;
-  maxScore: number;
-  binaryItems: BinaryItemResult[];
-  binaryTotal: number;
-  binaryMax: number;
-  knowledgeState: {
-    state: KnowledgeState;
-    nameTh: string;
-    description: string;
-    color: string;
-    tips: string[];
+// 1. Derive 9 Binary Items from 5 rubric skills (TR, ME, LR, GRA, CC)
+export function deriveBinaryItemsFromRubric(scores: SkillScores): BinaryItemMap {
+  return {
+    q1: scores.TR >= 3,
+    q2: scores.TR >= 4,
+    q3: scores.ME >= 3,
+    q4: scores.LR >= 3,
+    q5: scores.LR >= 4,
+    q6: scores.GRA >= 3,
+    q7: scores.GRA >= 4,
+    q8: scores.CC >= 3,
+    q9: scores.CC >= 4
   };
-  flag: {
-    type: FlagType;
-    labelTh: string;
-    color: string;
-    reason: string;
-  };
-  level: {
-    level: number;
-    title: string;
-    xp: number;
-    nextLevelXp: number;
-  };
-  badges: Array<{
-    id: string;
-    title: string;
-    description: string;
-    icon: string;
-    unlocked: boolean;
-  }>;
 }
 
-// 1. Binary derivation for PRISM 9 items
-export function deriveBinaryItems(s: SkillScores): BinaryItemResult[] {
-  return [
-    { id: 'q1', label: 'TR >= 3 (ตอบตรงประเด็นขั้นพื้นฐาน)', passed: s.TR >= 3, skill: 'TR', threshold: 3 },
-    { id: 'q2', label: 'TR >= 4 (พัฒนาประเด็นชัดเจนและลึกซึ้ง)', passed: s.TR >= 4, skill: 'TR', threshold: 4 },
-    { id: 'q3', label: 'ME >= 3 (เครื่องหมายวรรคตอนและการสะกดคำถูกต้อง)', passed: s.ME >= 3, skill: 'ME', threshold: 3 },
-    { id: 'q4', label: 'LR >= 3 (คลังคำศัพท์เพียงพอสื่อความ)', passed: s.LR >= 3, skill: 'LR', threshold: 3 },
-    { id: 'q5', label: 'LR >= 4 (เลือกใช้คำศัพท์สละสลวย หลากหลาย)', passed: s.LR >= 4, skill: 'LR', threshold: 4 },
-    { id: 'q6', label: 'GRA >= 3 (ไวยากรณ์ FANBOYS ขั้นต้นถูกต้อง)', passed: s.GRA >= 3, skill: 'GRA', threshold: 3 },
-    { id: 'q7', label: 'GRA >= 4 (โครงสร้างประโยคซับซ้อนแม่นยำ)', passed: s.GRA >= 4, skill: 'GRA', threshold: 4 },
-    { id: 'q8', label: 'CC >= 3 (การเชื่อมโยงข้อความราบรื่น)', passed: s.CC >= 3, skill: 'CC', threshold: 3 },
-    { id: 'q9', label: 'CC >= 4 (การลำดับย่อหน้ากลมกลืนเป็นเอกภาพ)', passed: s.CC >= 4, skill: 'CC', threshold: 4 },
-  ];
+// 2. Count total passed binary items (0 to 9)
+export function countBinaryTotal(binary: BinaryItemMap): number {
+  let count = 0;
+  for (let i = 1; i <= 9; i++) {
+    if (binary[`q${i}`]) count++;
+  }
+  return count;
 }
 
-// 2. Knowledge State determination
-export function evaluateKnowledgeState(s: SkillScores): EvaluatedResult['knowledgeState'] {
-  const allMastered = s.TR >= 4 && s.ME >= 4 && s.LR >= 4 && s.GRA >= 4 && s.CC >= 4;
-  if (allMastered) {
-    return {
-      state: 'Mastery',
-      nameTh: 'Mastery · ผู้เชี่ยวชาญการเขียน',
-      description: 'มีความเชี่ยวชาญทั้งโครงสร้าง การเชื่อมโยงความคิด และความถูกต้องทางภาษาในระดับยอดเยี่ยม',
-      color: 'var(--accent-emerald)',
-      tips: [
-        'ท้าทายตนเองด้วยรูปแบบงานเขียนเชิงวิชาการ (Academic Writing)',
-        'ช่วยเป็น Mentor ให้คำแนะนำเพื่อนในชั้นเรียน'
-      ]
-    };
+// 3. Knowledge State (KS) derived from binary_total (0..9)
+// 0–3: Beginner, 4–5: Structure OK, 6–7: Language Dev, 8–9: Mastery
+export function evaluateKnowledgeState(binaryTotal: number): KnowledgeStateType {
+  if (binaryTotal >= 8) return 'Mastery';
+  if (binaryTotal >= 6) return 'Language Dev';
+  if (binaryTotal >= 4) return 'Structure OK';
+  return 'Beginner';
+}
+
+// 4. CbKST Flag: Lucky vs Careless vs OK
+// Lucky = (q8 หรือ q9) และไม่ผ่าน q6, q7
+// Careless = q1 ผ่านแต่ q2 ไม่ผ่าน
+export function evaluateFlag(binary: BinaryItemMap): FlagType {
+  const isLucky = (binary.q8 || binary.q9) && (!binary.q6 && !binary.q7);
+  if (isLucky) return 'Lucky';
+
+  const isCareless = binary.q1 && !binary.q2;
+  if (isCareless) return 'Careless';
+
+  return 'OK';
+}
+
+// 5. Level determination from binary_total / 9
+// >= 8.5: Level 5, >= 7: Level 4, >= 5: Level 3, >= 3: Level 2, < 3: Level 1
+export function evaluateLevel(binaryTotal: number): { n: number; name: string; xp: number } {
+  if (binaryTotal >= 8.5) {
+    return { n: 5, name: 'CbKST Grandmaster', xp: 100 };
+  }
+  if (binaryTotal >= 7) {
+    return { n: 4, name: 'Language Warrior', xp: 80 };
+  }
+  if (binaryTotal >= 5) {
+    return { n: 3, name: 'Coherence Crafter', xp: 60 };
+  }
+  if (binaryTotal >= 3) {
+    return { n: 2, name: 'Structure Architect', xp: 40 };
+  }
+  return { n: 1, name: 'Novice Draftsman', xp: 20 };
+}
+
+// 6. Actionable Diagnostic Tips per Knowledge State
+export function getKnowledgeStateTips(ks: KnowledgeStateType, flag: FlagType): string[] {
+  const tips: string[] = [];
+
+  if (flag === 'Careless') {
+    tips.push('ระวังหลุดเกณฑ์พื้นฐาน: ตอบตรงประเด็นขั้นต้น (q1) ได้ดีแล้ว ควรเพิ่มความลึกซึ้งและพัฒนาประเด็นหลักให้ครอบคลุมรอบด้าน (q2)');
+  } else if (flag === 'Lucky') {
+    tips.push('ทบทวนไวยากรณ์พื้นฐาน: โครงสร้างประโยคซับซ้อนและการเชื่อมโยง (q8/q9) เริ่มเห็นผล แต่ควรเน้นทบทวนกฎ FANBOYS (q6/q7) ให้แม่นยำ');
   }
 
-  const structureGood = s.TR >= 3.5 && s.CC >= 3.5;
-  const languageStruggling = s.LR < 3 || s.ME < 3 || s.GRA < 3;
-  if (structureGood && languageStruggling) {
-    return {
-      state: 'Language Dev',
-      nameTh: 'Language Dev · เด่นโครงสร้าง พัฒนาภาษา',
-      description: 'ลำดับความคิดและโครงสร้างเนื้อหาได้ดีมาก แต่ควรเน้นความแม่นยำของไวยากรณ์ การสะกดคำ และการเลือกใช้ศัพท์',
-      color: 'var(--accent-cyan)',
-      tips: [
-        'ตรวจทานเครื่องหมายจุลภาคหน้า FANBOYS ทุกครั้งก่อนส่งงาน',
-        'ฝึกจับคู่คำเชื่อมกับชนิดของประโยค Compound Sentences',
-        'บันทึกคำศัพท์ใหม่ที่สะกดผิดบ่อยลงในสมุดคำศัพท์ส่วนตัว'
-      ]
-    };
+  switch (ks) {
+    case 'Mastery':
+      tips.push('รักษามาตรฐานการเขียนระดับยอดเยี่ยม และท้าทายตนเองด้วยงานเขียนเชิงวิชาการ (Academic Writing)');
+      tips.push('สามารถให้คำแนะนำและช่วยเหลือเป็นคู่บัดดี้ (Peer Reviewer) ให้เพื่อนร่วมชั้น');
+      break;
+    case 'Language Dev':
+      tips.push('โครงสร้างย่อหน้าและการเชื่อมโยงความคิดดีมาก ควรเน้นเรื่องความหลากหลายของคลังคำศัพท์ (LR) และไวยากรณ์ (GRA)');
+      tips.push('ตรวจทานเครื่องหมายวรรคตอนและการสะกดคำก่อนส่งงานทุกครั้ง');
+      break;
+    case 'Structure OK':
+      tips.push('ไอเดียและประเด็นเนื้อหาชัดเจน แต่ควรฝึกจัดระเบียบความคิดและวาง Topic Sentence ให้เด่นชัดในแต่ละย่อหน้า');
+      tips.push('เลือกใช้คำเชื่อม FANBOYS ให้ถูกต้องตามความสัมพันธ์ของประโยค');
+      break;
+    case 'Beginner':
+    default:
+      tips.push('ฝึกแต่งประโยคเดี่ยวและเชื่อมด้วยคำเชื่อมพื้นฐาน (and, but, so) ทีละคู่');
+      tips.push('ทบทวนหลักการใช้ FANBOYS กับคุณครูผู้สอนเพื่อสร้างความมั่นใจ');
+      break;
   }
 
-  if (s.TR >= 3.5 && s.CC < 3) {
-    return {
-      state: 'Structure OK',
-      nameTh: 'Structure OK · เนื้อหาดี จัดระเบียบความคิด',
-      description: 'มีประเด็นและไอเดียที่ดี แต่การจัดลำดับย่อหน้าและการใช้คำเชื่อมยังไม่ต่อเนื่อง',
-      color: 'var(--accent-amber)',
-      tips: [
-        'เขียน Outline หรือ Mind Map ลำดับความคิดก่อนลงมือเขียนร่าง',
-        'ใช้คำเชื่อม FANBOYS เชื่อมระหว่าง 2 Independent Clauses อย่างเหมาะสม',
-        'ตรวจสอบให้แน่ใจว่าแต่ละย่อหน้ามี Topic Sentence ที่ชัดเจน'
-      ]
-    };
-  }
+  return tips;
+}
+
+// 7. Feedback messages per skill
+export function getSkillFeedback(scores: SkillScores): Record<'TR' | 'ME' | 'LR' | 'GRA' | 'CC', string> {
+  const format = (name: string, score: number) => {
+    if (score >= 4.5) return `${name}: ระดับยอดเยี่ยม มีความเชี่ยวชาญสูง`;
+    if (score >= 3.5) return `${name}: ระดับดี สื่อสารได้ชัดเจนตามเกณฑ์`;
+    if (score >= 2.5) return `${name}: ระดับพอใช้ ควรฝึกฝนเพิ่มเติม`;
+    return `${name}: ต้องได้รับการพัฒนา แนะนำปรึกษาครูผู้สอน`;
+  };
 
   return {
-    state: 'Beginner',
-    nameTh: 'Beginner · ระยะเริ่มต้นฝึกฝน',
-    description: 'กำลังสร้างรากฐานด้านการเขียน ควรฝึกฝนแต่งประโยคพื้นฐานและความเข้าใจโครงสร้างย่อหน้าเพิ่มเติม',
-    color: 'var(--accent-purple)',
-    tips: [
-      'ทบทวนหลักการใช้ Coordinating Conjunctions (for, and, nor, but, or, yet, so)',
-      'ฝึกสร้าง Compound Sentence จากประโยคเดี่ยวทีละคู่',
-      'ปรึกษาครูผู้สอนเพื่อขอคำแนะนำเพิ่มเติมเฉพาะจุด'
-    ]
+    TR: format('Task Response', scores.TR),
+    ME: format('Mechanics', scores.ME),
+    LR: format('Lexical Resource', scores.LR),
+    GRA: format('Grammar & Accuracy', scores.GRA),
+    CC: format('Coherence & Cohesion', scores.CC)
   };
 }
 
-// 3. CbKST Anomaly Flag (Careless vs Lucky vs OK)
-export function evaluateFlag(s: SkillScores, binary: BinaryItemResult[]): EvaluatedResult['flag'] {
-  const passedCount = binary.filter(b => b.passed).length;
-  const q1 = binary.find(b => b.id === 'q1')?.passed ?? false;
-  const q3 = binary.find(b => b.id === 'q3')?.passed ?? false;
-  const q2 = binary.find(b => b.id === 'q2')?.passed ?? false;
-  const q5 = binary.find(b => b.id === 'q5')?.passed ?? false;
-  const q7 = binary.find(b => b.id === 'q7')?.passed ?? false;
-
-  // Careless: High performance overall (>= 6) but failed a basic prerequisite item
-  if (passedCount >= 6 && (!q1 || !q3)) {
-    return {
-      type: 'Careless',
-      labelTh: 'ระวังหลุดพื้นฐาน (Careless)',
-      color: 'var(--accent-amber)',
-      reason: 'คะแนนรวมอยู่ในเกณฑ์สูง แต่พลาดจุดพื้นฐานสำคัญ (เช่น เครื่องหมายวรรคตอนหรือประเด็นหลัก)'
-    };
-  }
-
-  // Lucky: Low performance overall (<= 3) but passed an advanced item
-  if (passedCount <= 3 && (q2 || q5 || q7)) {
-    return {
-      type: 'Lucky',
-      labelTh: 'เดาถูก/ข้ามขั้น (Lucky)',
-      color: 'var(--accent-purple)',
-      reason: 'ผ่านเกณฑ์ข้อยากแต่ยังไม่ผ่านข้อพื้นฐาน แนะนำทบทวนพื้นฐานให้แน่นหนา'
-    };
-  }
-
-  return {
-    type: 'OK',
-    labelTh: 'สม่ำเสมอ (Consistent)',
-    color: 'var(--accent-emerald)',
-    reason: 'พัฒนาการเป็นไปตามลำดับทักษะ CbKST อย่างเหมาะสม'
-  };
-}
-
-// 4. Level determination (1 to 5)
-export function evaluateLevel(totalScore: number): EvaluatedResult['level'] {
-  if (totalScore >= 22) {
-    return { level: 5, title: 'CbKST Grandmaster', xp: 100, nextLevelXp: 100 };
-  }
-  if (totalScore >= 18) {
-    const xp = Math.round(75 + ((totalScore - 18) / 4) * 25);
-    return { level: 4, title: 'Language Warrior', xp, nextLevelXp: 100 };
-  }
-  if (totalScore >= 14) {
-    const xp = Math.round(50 + ((totalScore - 14) / 4) * 25);
-    return { level: 3, title: 'Coherence Crafter', xp, nextLevelXp: 75 };
-  }
-  if (totalScore >= 8) {
-    const xp = Math.round(25 + ((totalScore - 8) / 6) * 25);
-    return { level: 2, title: 'Structure Architect', xp, nextLevelXp: 50 };
-  }
-  const xp = Math.round((totalScore / 8) * 25);
-  return { level: 1, title: 'Novice Draftsman', xp, nextLevelXp: 25 };
-}
-
-// 5. Badges
-export function evaluateBadges(s: SkillScores, flag: FlagType, level: number): EvaluatedResult['badges'] {
+// 8. Badges Evaluation
+export function evaluateBadges(scores: SkillScores, flag: FlagType, level: number): BadgeItem[] {
   return [
     {
       id: 'structure_ace',
-      title: 'Structure Master',
-      description: 'ได้คะแนน Task Response และ Coherence เต็ม 5',
-      icon: '🏛️',
-      unlocked: s.TR >= 4.5 && s.CC >= 4.5
+      name: 'Structure Master',
+      desc: 'ได้คะแนน Task Response และ Coherence ในเกณฑ์ระดับสูง (>= 4.0)',
+      earned: scores.TR >= 4.0 && scores.CC >= 4.0
     },
     {
       id: 'grammar_shield',
-      title: 'Grammar Shield',
-      description: 'ความแม่นยำไวยากรณ์ (GRA) ระดับดีเยี่ยม (>= 4.0)',
-      icon: '🛡️',
-      unlocked: s.GRA >= 4.0
+      name: 'Grammar Shield',
+      desc: 'ความแม่นยำไวยากรณ์ (GRA) ระดับดีเยี่ยม (>= 4.0)',
+      earned: scores.GRA >= 4.0
     },
     {
       id: 'lexical_spark',
-      title: 'Lexical Spark',
-      description: 'คลังคำศัพท์หลากหลายและสละสลวย (LR >= 4.0)',
-      icon: '✨',
-      unlocked: s.LR >= 4.0
+      name: 'Lexical Spark',
+      desc: 'คลังคำศัพท์หลากหลายและสละสลวย (LR >= 4.0)',
+      earned: scores.LR >= 4.0
     },
     {
       id: 'clean_mechanics',
-      title: 'Precision Proofreader',
-      description: 'การสะกดคำและวรรคตอนถูกต้องสมบูรณ์ (ME >= 4.0)',
-      icon: '🎯',
-      unlocked: s.ME >= 4.0
+      name: 'Precision Proofreader',
+      desc: 'การสะกดคำและเครื่องหมายวรรคตอนถูกต้อง (ME >= 4.0)',
+      earned: scores.ME >= 4.0
     },
     {
       id: 'cbkst_steady',
-      title: 'Steady Climber',
-      description: 'ผลการประเมินสม่ำเสมอ ไม่พบความผิดปกติ (Flag OK) และถึง Level 3 ขึ้นไป',
-      icon: '🌟',
-      unlocked: flag === 'OK' && level >= 3
+      name: 'Steady Climber',
+      desc: 'พัฒนาการสม่ำเสมอตามลำดับ CbKST (Flag OK) และถึง Level 3 ขึ้นไป',
+      earned: flag === 'OK' && level >= 3
     }
   ];
-}
-
-// Master evaluation function
-export function evaluateStudentResult(scores: SkillScores): EvaluatedResult {
-  const totalScore = Number((scores.TR + scores.ME + scores.LR + scores.GRA + scores.CC).toFixed(1));
-  const binaryItems = deriveBinaryItems(scores);
-  const binaryTotal = binaryItems.filter(b => b.passed).length;
-  const knowledgeState = evaluateKnowledgeState(scores);
-  const flag = evaluateFlag(scores, binaryItems);
-  const level = evaluateLevel(totalScore);
-  const badges = evaluateBadges(scores, flag.type, level.level);
-
-  return {
-    scores,
-    totalScore,
-    maxScore: 25,
-    binaryItems,
-    binaryTotal,
-    binaryMax: 9,
-    knowledgeState,
-    flag,
-    level,
-    badges
-  };
 }

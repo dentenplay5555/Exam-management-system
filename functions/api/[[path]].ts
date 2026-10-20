@@ -1,56 +1,50 @@
 // Cloudflare Pages Functions - Hub API Router
-// Server-Side only. Handles all /api/* requests with security, authentication, and verified CbKST rule evaluation.
+// Server-Side only. Secure session (HMAC-SHA256), strict role enforcement, verified CbKST evaluation,
+// and direct query to writing_assessment_final with service_role.
 
-import { evaluateStudentResult, type SkillScores } from '../../server/cbkst';
+import {
+  deriveBinaryItemsFromRubric,
+  countBinaryTotal,
+  evaluateKnowledgeState,
+  evaluateFlag,
+  evaluateLevel,
+  getKnowledgeStateTips,
+  getSkillFeedback,
+  evaluateBadges,
+  type SkillScores,
+  type BinaryItemMap
+} from '../../server/cbkst';
+import {
+  signSession,
+  verifySession,
+  generateOAuthState,
+  parseCookies,
+  type UserSession
+} from '../../server/auth';
+import type {
+  KnowledgeStateType,
+  FlagType,
+  StudentResultPayload,
+  TeacherReportPayload,
+  TeacherSubmissionStatus,
+  StudentExerciseItem
+} from '../../src/types';
 
-interface Env {
+export interface Env {
   SUPABASE_URL?: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
   SESSION_SECRET?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  DEV_EMAILS?: string;
+  TEACHER_EMAILS?: string;
 }
 
-interface UserSession {
-  id: string;
-  email: string;
-  name: string;
-  role: 'student' | 'teacher' | 'dev';
-  classes?: string[];
-}
+// Default fallback secret for development if not configured
+const DEFAULT_DEV_SECRET = 'prism-hub-nssc-super-secret-key-32b';
 
-// In-memory or baseline roster for Nakhon Sawan School (NSSC)
-const DEFAULT_STUDENTS = [
-  { id: 'usr-stu-01', name: 'ด.ช. กฤษณะ วงศ์สวัสดิ์', email: '52001.kritsana@student.nssc.ac.th', class: 'ม.3/1', no: 1, scores: { TR: 4.5, ME: 4.0, LR: 4.0, GRA: 4.5, CC: 4.5 } },
-  { id: 'usr-stu-02', name: 'ด.ญ. ชลธิชา สุขเกษม', email: '52002.chonticha@student.nssc.ac.th', class: 'ม.3/1', no: 2, scores: { TR: 4.0, ME: 2.5, LR: 2.5, GRA: 3.5, CC: 4.0 } },
-  { id: 'usr-stu-03', name: 'ด.ช. ปัณณธร ศรีสุข', email: '52003.pannatorn@student.nssc.ac.th', class: 'ม.3/1', no: 3, scores: { TR: 3.5, ME: 3.0, LR: 3.0, GRA: 3.0, CC: 2.5 } },
-  { id: 'usr-stu-04', name: 'ด.ญ. ณัชชา แสงเพชร', email: '52004.natcha@student.nssc.ac.th', class: 'ม.3/1', no: 4, scores: { TR: 2.5, ME: 2.0, LR: 2.5, GRA: 2.5, CC: 2.0 } },
-  { id: 'usr-stu-05', name: 'ด.ช. ภัทรพล เจริญศิลป์', email: '52005.pattarapol@student.nssc.ac.th', class: 'ม.3/1', no: 5, scores: { TR: 4.0, ME: 2.0, LR: 4.5, GRA: 4.0, CC: 4.5 } },
-  { id: 'usr-stu-06', name: 'ด.ญ. วิมลิน โชคอำนวย', email: '52006.wimolin@student.nssc.ac.th', class: 'ม.3/2', no: 1, scores: { TR: 4.0, ME: 4.0, LR: 3.5, GRA: 4.0, CC: 4.0 } },
-  { id: 'usr-stu-07', name: 'ด.ช. ศิวกร วัฒนา', email: '52007.siwakorn@student.nssc.ac.th', class: 'ม.3/2', no: 2, scores: { TR: 3.0, ME: 2.5, LR: 2.5, GRA: 3.0, CC: 3.0 } },
-];
-
-function parseCookies(cookieHeader: string | null): Record<string, string> {
-  const cookies: Record<string, string> = {};
-  if (!cookieHeader) return cookies;
-  for (const item of cookieHeader.split(';')) {
-    const [k, v] = item.trim().split('=');
-    if (k && v) cookies[k] = decodeURIComponent(v);
-  }
-  return cookies;
-}
-
-function getSessionUser(request: Request): UserSession | null {
-  const cookies = parseCookies(request.headers.get('Cookie'));
-  const sessionToken = cookies['practice_hub_session'];
-  if (!sessionToken) return null;
-
-  try {
-    const raw = atob(sessionToken);
-    const user = JSON.parse(raw) as UserSession;
-    if (user && user.id && user.role) return user;
-  } catch {}
-  return null;
+function getSessionSecret(env: Env): string {
+  return env.SESSION_SECRET || DEFAULT_DEV_SECRET;
 }
 
 function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): Response {
@@ -63,23 +57,32 @@ function jsonResponse(data: unknown, status = 200, headers: HeadersInit = {}): R
   });
 }
 
-function errorResponse(code: string, message: string, status = 400): Response {
-  return jsonResponse({ error: code, message }, status);
+function errorResponse(code: string, message: string, status = 400, headers: HeadersInit = {}): Response {
+  return jsonResponse(
+    {
+      error: { code, message },
+      code,
+      message
+    },
+    status,
+    headers
+  );
 }
 
 // Fetch from Supabase using service_role on server
-async function fetchSupabaseAssessments(env: Env): Promise<any[] | null> {
+async function querySupabase(env: Env, endpoint: string): Promise<any[] | null> {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
   try {
-    const url = `${env.SUPABASE_URL.replace(/\/$/, '')}/rest/v1/writing_assessment_final?select=*`;
+    const base = env.SUPABASE_URL.replace(/\/$/, '');
+    const url = `${base}/rest/v1/${endpoint}`;
     const res = await fetch(url, {
       headers: {
         'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
-        'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`
       }
     });
     if (res.ok) {
-      return await res.json();
+      return (await res.json()) as any[];
     }
   } catch (e) {
     console.error('Failed to query Supabase server-side:', e);
@@ -87,44 +90,130 @@ async function fetchSupabaseAssessments(env: Env): Promise<any[] | null> {
   return null;
 }
 
-export const onRequest: PagesFunction<Env> = async (context) => {
+// Helper to extract student row from writing_assessment_final
+function normalizeStudentRow(r: any, idx = 0) {
+  const scores: SkillScores = {
+    TR: Number(r.tr ?? r.score_tr ?? r.TR ?? 0),
+    ME: Number(r.me ?? r.score_me ?? r.ME ?? 0),
+    LR: Number(r.lr ?? r.score_lr ?? r.LR ?? 0),
+    GRA: Number(r.gra ?? r.score_gra ?? r.GRA ?? 0),
+    CC: Number(r.cc ?? r.score_cc ?? r.CC ?? 0)
+  };
+
+  const rubricTotal = Number((scores.TR + scores.ME + scores.LR + scores.GRA + scores.CC).toFixed(1));
+
+  // Binary items: use view columns q1..q9 if present, or derive from rubric
+  let binary: BinaryItemMap;
+  if (r.q1 !== undefined && r.q2 !== undefined) {
+    binary = {
+      q1: Boolean(r.q1 === 1 || r.q1 === true || r.q1 === '1'),
+      q2: Boolean(r.q2 === 1 || r.q2 === true || r.q2 === '1'),
+      q3: Boolean(r.q3 === 1 || r.q3 === true || r.q3 === '1'),
+      q4: Boolean(r.q4 === 1 || r.q4 === true || r.q4 === '1'),
+      q5: Boolean(r.q5 === 1 || r.q5 === true || r.q5 === '1'),
+      q6: Boolean(r.q6 === 1 || r.q6 === true || r.q6 === '1'),
+      q7: Boolean(r.q7 === 1 || r.q7 === true || r.q7 === '1'),
+      q8: Boolean(r.q8 === 1 || r.q8 === true || r.q8 === '1'),
+      q9: Boolean(r.q9 === 1 || r.q9 === true || r.q9 === '1')
+    };
+  } else {
+    binary = deriveBinaryItemsFromRubric(scores);
+  }
+
+  const binaryTotal = Number(r.binary_total ?? r.tot ?? countBinaryTotal(binary));
+
+  // KS & Flag: Use view columns if present, otherwise compute by verified real rules
+  const ks: KnowledgeStateType = (r.ks && ['Mastery', 'Language Dev', 'Structure OK', 'Beginner'].includes(r.ks))
+    ? r.ks
+    : evaluateKnowledgeState(binaryTotal);
+
+  const flag: FlagType = (r.flag && ['OK', 'Lucky', 'Careless'].includes(r.flag))
+    ? r.flag
+    : evaluateFlag(binary);
+
+  const level = evaluateLevel(binaryTotal);
+
+  return {
+    id: String(r.id || r.student_id || `stu-${idx + 1}`),
+    name: String(r.name || r.student_name || `นักเรียนคนที่ ${idx + 1}`),
+    class: String(r.class || r.classroom || 'ม.3/1'),
+    no: Number(r.no || r.student_number || idx + 1),
+    scores,
+    rubricTotal,
+    binary,
+    binaryTotal,
+    ks,
+    flag,
+    level,
+    tips: getKnowledgeStateTips(ks, flag),
+    feedback: getSkillFeedback(scores),
+    badges: evaluateBadges(scores, flag, level.n)
+  };
+}
+
+export const onRequest = async (context: {
+  request: Request;
+  env: Env;
+  params?: any;
+  waitUntil?: (promise: Promise<any>) => void;
+  next?: () => Promise<Response>;
+}): Promise<Response> => {
   const { request, env } = context;
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/api\/?/, '');
   const method = request.method;
+  const isHttps = url.protocol === 'https:';
+  const cookieHeader = request.headers.get('Cookie');
+  const cookies = parseCookies(cookieHeader);
+  const secret = getSessionSecret(env);
 
-  // 1. Auth: GET /api/auth/google/start
+  // ----------------------------------------------------
+  // 1. Auth: GET /api/auth/google/start (OAuth Start)
+  // ----------------------------------------------------
   if (path === 'auth/google/start') {
-    const redirectUri = `${url.origin}/api/auth/google/callback`;
-    if (!env.GOOGLE_CLIENT_ID) {
-      // In local testing without Google Client ID, simulate Google OAuth login
-      const mockSession: UserSession = {
-        id: 'usr-teacher-01',
-        name: 'อาจารย์สมเกียรติ ยิ่งเจริญ (NSSC)',
-        email: 'somkiat.y@nssc.ac.th',
-        role: 'teacher',
-        classes: ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4']
-      };
-      const token = btoa(JSON.stringify(mockSession));
-      return new Response(null, {
-        status: 302,
-        headers: {
-          'Location': '/teacher',
-          'Set-Cookie': `practice_hub_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`
-        }
-      });
+    // Fail-closed check: No auto-login! If OAuth is unconfigured, return 500 error.
+    if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+      return errorResponse(
+        'CONFIG_ERROR',
+        'Google OAuth ยังไม่ได้ตั้งค่าบนเซิร์ฟเวอร์ กรุณาตั้งค่า GOOGLE_CLIENT_ID และ GOOGLE_CLIENT_SECRET ใน Environment Variables',
+        500
+      );
     }
 
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(env.GOOGLE_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20email%20profile&hd=nssc.ac.th`;
-    return Response.redirect(authUrl, 302);
+    const state = generateOAuthState();
+    const redirectUri = `${url.origin}/api/auth/google/callback`;
+    const googleAuthUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(env.GOOGLE_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20email%20profile&state=${encodeURIComponent(state)}&hd=nssc.ac.th&prompt=select_account`;
+
+    // Secure HttpOnly CSRF state cookie with 5-minute expiry
+    const secureFlag = isHttps ? 'Secure; ' : '';
+    return new Response(null, {
+      status: 302,
+      headers: {
+        'Location': googleAuthUrl,
+        'Set-Cookie': `oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; ${secureFlag}Max-Age=300`
+      }
+    });
   }
 
-  // 2. Auth: GET /api/auth/google/callback
+  // ----------------------------------------------------
+  // 2. Auth: GET /api/auth/google/callback (OAuth Callback)
+  // ----------------------------------------------------
   if (path === 'auth/google/callback') {
     const code = url.searchParams.get('code');
-    if (!code) return errorResponse('AUTH_FAILED', 'ไม่พบรหัสยืนยันจาก Google', 400);
+    const returnedState = url.searchParams.get('state');
+    const expectedState = cookies['oauth_state'];
+
+    // CSRF verification
+    if (!returnedState || !expectedState || returnedState !== expectedState) {
+      return errorResponse('CSRF_ERROR', 'การยืนยัน state ป้องกัน CSRF ล้มเหลว กรุณาลองเข้าสู่ระบบใหม่อีกครั้ง', 400);
+    }
+
+    if (!code) {
+      return errorResponse('AUTH_FAILED', 'ไม่พบรหัสยืนยัน (code) จาก Google', 400);
+    }
 
     try {
+      const redirectUri = `${url.origin}/api/auth/google/callback`;
       const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -132,364 +221,590 @@ export const onRequest: PagesFunction<Env> = async (context) => {
           code,
           client_id: env.GOOGLE_CLIENT_ID || '',
           client_secret: env.GOOGLE_CLIENT_SECRET || '',
-          redirect_uri: `${url.origin}/api/auth/google/callback`,
+          redirect_uri: redirectUri,
           grant_type: 'authorization_code'
         })
       });
+
+      if (!tokenRes.ok) {
+        return errorResponse('AUTH_FAILED', 'ไม่สามารถแลกเปลี่ยนโทเคนกับ Google ได้', 401);
+      }
+
       const tokenData = (await tokenRes.json()) as any;
       const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { Authorization: `Bearer ${tokenData.access_token}` }
       });
-      const profile = (await userRes.json()) as any;
-      const email = (profile.email || '').toLowerCase();
 
-      // Determine role from verified email
-      let role: 'student' | 'teacher' | 'dev' = 'student';
-      if (email.includes('teacher') || email.includes('kru') || email.startsWith('somkiat')) {
-        role = 'teacher';
-      } else if (email.includes('admin') || email.includes('dev')) {
-        role = 'dev';
+      if (!userRes.ok) {
+        return errorResponse('AUTH_FAILED', 'ไม่สามารถดึงข้อมูลโปรไฟล์จาก Google ได้', 401);
       }
 
-      const session: UserSession = {
-        id: `usr-${profile.id || btoa(email).slice(0, 8)}`,
-        name: profile.name || 'ผู้ใช้ NSSC',
+      const profile = (await userRes.json()) as any;
+      const email = (profile.email || '').toLowerCase().trim();
+
+      // Enforce email_verified
+      if (!profile.verified_email && !profile.email_verified) {
+        return errorResponse('UNVERIFIED_EMAIL', 'อีเมล Google ของคุณยังไม่ได้รับการยืนยันตัวตน', 403);
+      }
+
+      // Enforce allowed school domains (@nssc.ac.th, @student.nssc.ac.th)
+      const isSchoolDomain = email.endsWith('@nssc.ac.th') || email.endsWith('@student.nssc.ac.th');
+      if (!isSchoolDomain) {
+        return errorResponse(
+          'FORBIDDEN_DOMAIN',
+          'ระบบอนุญาตเฉพาะบัญชีอีเมลของโรงเรียนนครสวรรค์ (@nssc.ac.th หรือ @student.nssc.ac.th) เท่านั้น',
+          403
+        );
+      }
+
+      // Determine Role strictly from verified lists (NEVER substring guessing)
+      const devEmails = (env.DEV_EMAILS || 'admin@nssc.ac.th')
+        .split(',')
+        .map(e => e.trim().toLowerCase())
+        .filter(Boolean);
+
+      const teacherEmails = (env.TEACHER_EMAILS || 'somkiat.y@nssc.ac.th')
+        .split(',')
+        .map(e => e.trim().toLowerCase())
+        .filter(Boolean);
+
+      let role: 'student' | 'teacher' | 'dev' = 'student';
+      let teacherClasses: string[] | undefined = undefined;
+
+      if (devEmails.includes(email)) {
+        role = 'dev';
+      } else if (teacherEmails.includes(email)) {
+        role = 'teacher';
+        teacherClasses = ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4'];
+      }
+
+      const sessionUser: UserSession = {
+        id: `usr-${profile.id || btoa(email).slice(0, 10)}`,
+        name: profile.name || (role === 'teacher' ? 'อาจารย์' : 'นักเรียน'),
         email,
         role,
-        classes: role === 'teacher' ? ['ม.3/1', 'ม.3/2'] : undefined
+        classes: teacherClasses
       };
 
-      const token = btoa(JSON.stringify(session));
-      const target = role === 'student' ? '/student' : role === 'teacher' ? '/teacher' : '/dev/exercises';
+      // Sign session with HMAC-SHA256
+      const sessionToken = await signSession(sessionUser, secret);
+      const secureFlag = isHttps ? 'Secure; ' : '';
+      const targetUrl = role === 'student' ? '/student' : role === 'teacher' ? '/teacher' : '/dev/exercises';
+
       return new Response(null, {
         status: 302,
         headers: {
-          'Location': target,
-          'Set-Cookie': `practice_hub_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`
+          'Location': targetUrl,
+          'Set-Cookie': `practice_hub_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; ${secureFlag}Max-Age=604800`
         }
       });
-    } catch {
-      return errorResponse('AUTH_FAILED', 'การเข้าสู่ระบบผ่าน Google ล้มเหลว', 500);
+    } catch (e: any) {
+      console.error('OAuth callback error:', e);
+      return errorResponse('AUTH_FAILED', 'เกิดข้อผิดพลาดในการยืนยันตัวตนกับ Google', 500);
     }
   }
 
+  // ----------------------------------------------------
   // 3. Auth: POST /api/auth/logout
+  // ----------------------------------------------------
   if (path === 'auth/logout') {
+    const secureFlag = isHttps ? 'Secure; ' : '';
     return jsonResponse({ ok: true }, 200, {
-      'Set-Cookie': 'practice_hub_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'
+      'Set-Cookie': `practice_hub_session=; Path=/; HttpOnly; SameSite=Lax; ${secureFlag}Max-Age=0`
     });
   }
 
-  // 4. GET /api/me
+  // ----------------------------------------------------
+  // 4. GET /api/me (Session Check)
+  // ----------------------------------------------------
+  const rawSession = cookies['practice_hub_session'];
+  const currentUser: UserSession | null = rawSession ? await verifySession(rawSession, secret) : null;
+
   if (path === 'me') {
-    const user = getSessionUser(request);
-    if (!user) {
-      return errorResponse('UNAUTHORIZED', 'กรุณาเข้าสู่ระบบก่อนใช้งาน', 401);
+    if (!currentUser) {
+      return errorResponse('UNAUTHORIZED', 'กรุณาเข้าสู่ระบบก่อนดำเนินการ', 401);
     }
-    return jsonResponse(user);
+    return jsonResponse({
+      id: currentUser.id,
+      name: currentUser.name,
+      email: currentUser.email,
+      role: currentUser.role,
+      classes: currentUser.classes || []
+    });
   }
 
-  // Protected Routes Check
-  const currentUser = getSessionUser(request);
+  // ----------------------------------------------------
+  // Guard: Must be authenticated for all endpoints below
+  // ----------------------------------------------------
+  if (!currentUser) {
+    return errorResponse('UNAUTHORIZED', 'กรุณาเข้าสู่ระบบก่อนใช้งาน', 401);
+  }
 
+  // ----------------------------------------------------
   // 5. GET /api/student/exercises
+  // ----------------------------------------------------
   if (path === 'student/exercises') {
-    if (!currentUser) return errorResponse('UNAUTHORIZED', 'กรุณาเข้าสู่ระบบ', 401);
-    return jsonResponse([
+    const exercises: StudentExerciseItem[] = [
       {
         id: 'prism-fanboys-pretest',
         name: 'PRISM · FANBOYS · Pretest',
-        cycle: 'Pretest',
+        series: 'FANBOYS Series',
+        phase: 'Pretest',
         status: 'COMPLETED',
-        score: 22.0,
-        maxScore: 25,
-        partsCompleted: 2,
-        totalParts: 2,
-        lastActivityAt: '2026-10-19T10:21:00Z'
+        dueAt: '2026-10-31T23:59:59Z',
+        attemptsUsed: 1,
+        maxAttempts: 1,
+        exerciseUrl: 'https://prism-fanboys.pages.dev'
       },
       {
         id: 'prism-fanboys-c1',
         name: 'PRISM · FANBOYS · Cycle 1',
-        cycle: 'Cycle 1',
+        series: 'FANBOYS Series',
+        phase: 'Cycle 1',
         status: 'IN_PROGRESS',
-        score: null,
-        maxScore: 25,
-        partsCompleted: 1,
-        totalParts: 2,
-        lastActivityAt: '2026-10-20T08:15:00Z'
+        dueAt: '2026-11-07T23:59:59Z',
+        attemptsUsed: 0,
+        maxAttempts: 1,
+        exerciseUrl: 'https://prism-fanboys.pages.dev'
       },
       {
         id: 'prism-fanboys-c2',
         name: 'PRISM · FANBOYS · Cycle 2',
-        cycle: 'Cycle 2',
+        series: 'FANBOYS Series',
+        phase: 'Cycle 2',
         status: 'TODO',
-        score: null,
-        maxScore: 25,
-        partsCompleted: 0,
-        totalParts: 2,
-        lastActivityAt: null
+        dueAt: '2026-11-14T23:59:59Z',
+        attemptsUsed: 0,
+        maxAttempts: 1,
+        exerciseUrl: 'https://prism-fanboys.pages.dev'
       },
       {
         id: 'prism-fanboys-post',
         name: 'PRISM · FANBOYS · Post-Test',
-        cycle: 'Post-test',
+        series: 'FANBOYS Series',
+        phase: 'Post-test',
         status: 'TODO',
-        score: null,
-        maxScore: 25,
-        partsCompleted: 0,
-        totalParts: 2,
-        lastActivityAt: null
+        dueAt: '2026-11-21T23:59:59Z',
+        attemptsUsed: 0,
+        maxAttempts: 1,
+        exerciseUrl: 'https://prism-fanboys.pages.dev'
       }
-    ]);
+    ];
+
+    return jsonResponse(exercises);
   }
 
+  // ----------------------------------------------------
   // 6. GET /api/student/results/:exId
+  // ----------------------------------------------------
   if (path.startsWith('student/results/')) {
-    if (!currentUser) return errorResponse('UNAUTHORIZED', 'กรุณาเข้าสู่ระบบ', 401);
     const exId = path.split('/')[2];
+    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
 
-    // Try to read actual student record from Supabase writing_assessment_final
-    const sbData = await fetchSupabaseAssessments(env);
-    let studentScores: SkillScores = { TR: 4.5, ME: 4.0, LR: 4.0, GRA: 4.5, CC: 4.5 };
-    let studentName = currentUser.name;
-    let studentClass = 'ม.3/1';
-    let studentNo = 1;
-
-    if (sbData && sbData.length > 0) {
-      const match = sbData.find((r: any) => r.email === currentUser.email || r.student_email === currentUser.email);
-      if (match) {
-        studentScores = {
-          TR: Number(match.tr || match.score_tr || 4),
-          ME: Number(match.me || match.score_me || 4),
-          LR: Number(match.lr || match.score_lr || 4),
-          GRA: Number(match.gra || match.score_gra || 4),
-          CC: Number(match.cc || match.score_cc || 4)
-        };
-        studentName = match.name || match.student_name || studentName;
-        studentClass = match.class || match.classroom || studentClass;
-        studentNo = Number(match.no || match.student_number || studentNo);
-      }
+    if (!sbRows || sbRows.length === 0) {
+      return errorResponse('NOT_FOUND', 'ไม่พบข้อมูลผลการประเมินของผู้เรียนในระบบ', 404);
     }
 
-    // Server-side verified CbKST evaluation
-    const evaluation = evaluateStudentResult(studentScores);
+    // Match student via PEM roster or direct mapping
+    let matchedRow = null;
 
-    return jsonResponse({
-      exerciseId: exId,
-      exerciseName: 'PRISM · FANBOYS · Pretest',
-      student: {
-        id: currentUser.id,
-        name: studentName,
-        email: currentUser.email,
-        class: studentClass,
-        no: studentNo
+    // 1. Check if Supabase has a PEM roster or student mapping table
+    try {
+      const rosterTables = ['pem_roster', 'student_roster', 'students'];
+      for (const table of rosterTables) {
+        const rosterRows = await querySupabase(env, `${table}?email=eq.${encodeURIComponent(currentUser.email)}`);
+        if (rosterRows && rosterRows.length > 0) {
+          const roster = rosterRows[0];
+          const studentId = roster.student_id || roster.id || roster.code;
+          const studentName = roster.name || roster.full_name;
+          const studentClass = roster.class || roster.classroom;
+          const studentNo = roster.no || roster.student_number;
+
+          matchedRow = sbRows.find((r: any) => {
+            if (studentId && (String(r.id) === String(studentId) || String(r.student_id) === String(studentId))) return true;
+            if (studentName && (r.name === studentName || r.student_name === studentName)) return true;
+            if (studentClass && studentNo && String(r.class || r.classroom) === String(studentClass) && Number(r.no || r.student_number) === Number(studentNo)) return true;
+            return false;
+          });
+          if (matchedRow) break;
+        }
+      }
+    } catch {
+      // Continue to direct column matching if roster table is not yet created
+    }
+
+    // 2. Direct column matching on writing_assessment_final
+    if (!matchedRow) {
+      const emailPrefixMatch = currentUser.email.match(/^(\d{5})/);
+      const studentIdFromEmail = emailPrefixMatch ? emailPrefixMatch[1] : null;
+
+      matchedRow = sbRows.find((r: any) => {
+        if (r.email && r.email.toLowerCase() === currentUser.email.toLowerCase()) return true;
+        if (r.student_email && r.student_email.toLowerCase() === currentUser.email.toLowerCase()) return true;
+        if (studentIdFromEmail && (String(r.id) === studentIdFromEmail || String(r.student_id) === studentIdFromEmail)) return true;
+        return false;
+      });
+    }
+
+    // Strictly return 404 if no real record found for student (no fake fallback!)
+    if (!matchedRow) {
+      return errorResponse(
+        'NOT_FOUND',
+        `ไม่พบข้อมูลผลการประเมินสำหรับบัญชี ${currentUser.email} กรุณาตรวจสอบว่าท่านได้ส่งแบบฝึกหัดแล้วหรือยัง หรือติดต่อผู้ดูแลระบบ`,
+        404
+      );
+    }
+
+    const norm = normalizeStudentRow(matchedRow);
+
+    const payload: StudentResultPayload = {
+      exercise: {
+        id: exId,
+        name: 'PRISM · FANBOYS · Pretest'
       },
-      attempt: 1,
-      submittedAt: '2026-10-19T10:21:00Z',
-      ...evaluation
-    });
+      student: {
+        name: norm.name,
+        class: norm.class,
+        no: norm.no
+      },
+      status: 'SUBMITTED',
+      scores: norm.scores,
+      rubricTotal: norm.rubricTotal,
+      binary: norm.binary,
+      binaryTotal: norm.binaryTotal,
+      level: norm.level,
+      ks: norm.ks,
+      flag: norm.flag,
+      badges: norm.badges,
+      feedback: norm.feedback,
+      tips: norm.tips,
+      attempts: {
+        used: 1,
+        max: 1
+      }
+    };
+
+    return jsonResponse(payload);
   }
 
+  // ----------------------------------------------------
   // 7. GET /api/teacher/classes
+  // ----------------------------------------------------
   if (path === 'teacher/classes') {
-    if (!currentUser || (currentUser.role !== 'teacher' && currentUser.role !== 'dev')) {
-      return errorResponse('FORBIDDEN', 'เฉพาะครูผู้สอนเท่านั้น', 403);
+    if (currentUser.role !== 'teacher' && currentUser.role !== 'dev') {
+      return errorResponse('FORBIDDEN', 'คุณไม่มีสิทธิ์เข้าถึงส่วนของครูผู้สอน', 403);
     }
-    return jsonResponse(['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4']);
+
+    const classes = currentUser.classes?.length
+      ? currentUser.classes
+      : ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4'];
+
+    return jsonResponse(classes);
   }
 
+  // ----------------------------------------------------
   // 8. GET /api/teacher/report/:exId/:classId
+  // ----------------------------------------------------
   if (path.startsWith('teacher/report/')) {
-    if (!currentUser || (currentUser.role !== 'teacher' && currentUser.role !== 'dev')) {
+    if (currentUser.role !== 'teacher' && currentUser.role !== 'dev') {
       return errorResponse('FORBIDDEN', 'เฉพาะครูผู้สอนเท่านั้น', 403);
     }
+
     const parts = path.split('/');
     const exId = parts[2];
-    const classId = decodeURIComponent(parts[3] || 'ม.3/1');
+    const classId = decodeURIComponent(parts[3] || '');
 
-    // Read from Supabase or default student roster
-    const sbData = await fetchSupabaseAssessments(env);
-    let classStudents = DEFAULT_STUDENTS.filter(s => s.class === classId);
-
-    if (sbData && sbData.length > 0) {
-      const filtered = sbData.filter((r: any) => (r.class || r.classroom) === classId);
-      if (filtered.length > 0) {
-        classStudents = filtered.map((r: any, idx: number) => ({
-          id: r.id || `sb-${idx}`,
-          name: r.name || r.student_name || `นักเรียนคนที่ ${idx + 1}`,
-          email: r.email || r.student_email || `student${idx + 1}@student.nssc.ac.th`,
-          class: classId,
-          no: Number(r.no || r.student_number || (idx + 1)),
-          scores: {
-            TR: Number(r.tr || r.score_tr || 3.5),
-            ME: Number(r.me || r.score_me || 3.0),
-            LR: Number(r.lr || r.score_lr || 3.0),
-            GRA: Number(r.gra || r.score_gra || 3.5),
-            CC: Number(r.cc || r.score_cc || 3.5)
-          }
-        }));
-      }
+    // Ownership check: Teacher can only view their own assigned classes
+    if (currentUser.role === 'teacher' && currentUser.classes && !currentUser.classes.includes(classId)) {
+      return errorResponse('FORBIDDEN', `คุณไม่มีสิทธิ์เข้าถึงข้อมูลของห้อง ${classId}`, 403);
     }
 
-    // Evaluate each student server-side
-    const evaluatedStudents = classStudents.map(st => {
-      const evalRes = evaluateStudentResult(st.scores);
+    // Query Supabase writing_assessment_final
+    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
+    if (!sbRows || sbRows.length === 0) {
+      return errorResponse('NOT_FOUND', `ไม่พบข้อมูลการประเมินสำหรับห้อง ${classId}`, 404);
+    }
+
+    // Filter students by class
+    const classRows = sbRows.filter((r: any) => {
+      const c = String(r.class || r.classroom || '').trim();
+      return c === classId || c === classId.replace('ม.', '');
+    });
+
+    if (classRows.length === 0) {
+      return errorResponse('NOT_FOUND', `ไม่พบรายชื่อนักเรียนที่มีผลการประเมินในห้อง ${classId}`, 404);
+    }
+
+    // Normalize each student
+    const evaluatedList = classRows.map((r, i) => normalizeStudentRow(r, i));
+    const submittedCount = evaluatedList.length;
+    let totalStudents = submittedCount;
+    try {
+      const rosterRows = await querySupabase(env, `student_roster?class=eq.${encodeURIComponent(classId)}`);
+      if (rosterRows && rosterRows.length > 0) {
+        totalStudents = rosterRows.length;
+      }
+    } catch {
+      totalStudents = submittedCount;
+    }
+    const notSubmitted = Math.max(0, totalStudents - submittedCount);
+
+    const avgRubric = Number(
+      (evaluatedList.reduce((acc, s) => acc + s.rubricTotal, 0) / submittedCount).toFixed(1)
+    );
+    const avgTot = Number(
+      (evaluatedList.reduce((acc, s) => acc + s.binaryTotal, 0) / submittedCount).toFixed(1)
+    );
+
+    const luckyCount = evaluatedList.filter(s => s.flag === 'Lucky').length;
+    const carelessCount = evaluatedList.filter(s => s.flag === 'Careless').length;
+
+    // Knowledge States distribution
+    const ksList: KnowledgeStateType[] = ['Mastery', 'Language Dev', 'Structure OK', 'Beginner'];
+    const knowledgeStates = ksList.map(name => {
+      const count = evaluatedList.filter(s => s.ks === name).length;
+      const pct = Math.round((count / submittedCount) * 100);
+      return { name, count, pct };
+    });
+
+    // Skills averages & pass rates (pass = score >= 3.0)
+    const skillCodes: Array<{ code: keyof SkillScores; name: string }> = [
+      { code: 'TR', name: 'Task Response' },
+      { code: 'ME', name: 'Mechanics' },
+      { code: 'LR', name: 'Lexical Resource' },
+      { code: 'GRA', name: 'Grammar & Accuracy' },
+      { code: 'CC', name: 'Coherence & Cohesion' }
+    ];
+
+    const skills = skillCodes.map(({ code, name }) => {
+      const total = evaluatedList.reduce((acc, s) => acc + s.scores[code], 0);
+      const passed = evaluatedList.filter(s => s.scores[code] >= 3.0).length;
       return {
-        id: st.id,
-        name: st.name,
-        email: st.email,
-        class: st.class,
-        no: st.no,
-        totalScore: evalRes.totalScore,
-        maxScore: 25,
-        scores: evalRes.scores,
-        knowledgeState: evalRes.knowledgeState.nameTh,
-        flag: evalRes.flag.type,
-        level: evalRes.level.level,
-        status: 'SUBMITTED'
+        code,
+        name,
+        avg: Number((total / submittedCount).toFixed(2)),
+        passPct: Math.round((passed / submittedCount) * 100)
       };
     });
 
-    const totalStudents = Math.max(classStudents.length, 36);
-    const submittedCount = evaluatedStudents.length;
-    const avgScore = evaluatedStudents.length > 0
-      ? Number((evaluatedStudents.reduce((sum, s) => sum + s.totalScore, 0) / evaluatedStudents.length).toFixed(1))
-      : 0;
-    const passRate = evaluatedStudents.length > 0
-      ? Math.round((evaluatedStudents.filter(s => s.totalScore >= 15).length / evaluatedStudents.length) * 100)
-      : 0;
-
-    // Calculate Radar averages per skill
-    const radar = [
-      { skill: 'TR', name: 'Task Response', average: 0, fullMark: 5 },
-      { skill: 'ME', name: 'Mechanics', average: 0, fullMark: 5 },
-      { skill: 'LR', name: 'Lexical Resource', average: 0, fullMark: 5 },
-      { skill: 'GRA', name: 'Grammar & Accuracy', average: 0, fullMark: 5 },
-      { skill: 'CC', name: 'Coherence & Cohesion', average: 0, fullMark: 5 },
-    ];
-    if (evaluatedStudents.length > 0) {
-      for (const item of radar) {
-        const k = item.skill as keyof SkillScores;
-        const totalK = evaluatedStudents.reduce((acc, curr) => acc + curr.scores[k], 0);
-        item.average = Number((totalK / evaluatedStudents.length).toFixed(2));
-      }
-    }
-
-    // Calculate Item Difficulty
-    const binaryItemsDef = [
-      { id: 'q1', label: 'TR >= 3 (ตอบตรงประเด็น)' },
-      { id: 'q2', label: 'TR >= 4 (พัฒนาประเด็นลึกซึ้ง)' },
-      { id: 'q3', label: 'ME >= 3 (วรรคตอน/สะกด)' },
-      { id: 'q4', label: 'LR >= 3 (คลังคำศัพท์พื้นฐาน)' },
-      { id: 'q5', label: 'LR >= 4 (คลังคำศัพท์หลากหลาย)' },
-      { id: 'q6', label: 'GRA >= 3 (ไวยากรณ์ FANBOYS)' },
-      { id: 'q7', label: 'GRA >= 4 (โครงสร้างซับซ้อน)' },
-      { id: 'q8', label: 'CC >= 3 (เชื่อมโยงความคิด)' },
-      { id: 'q9', label: 'CC >= 4 (ลำดับย่อหน้าเป็นเอกภาพ)' },
-    ];
-    const itemDifficulty = binaryItemsDef.map(def => {
-      const passedCount = evaluatedStudents.filter(st => {
-        const evalItem = evaluateStudentResult(st.scores).binaryItems.find(b => b.id === def.id);
-        return evalItem?.passed;
-      }).length;
-      const passRatePercent = evaluatedStudents.length > 0 ? Math.round((passedCount / evaluatedStudents.length) * 100) : 0;
+    // Item difficulty for q1..q9
+    const itemDifficulty = Array.from({ length: 9 }, (_, idx) => {
+      const qKey = `q${idx + 1}`;
+      const passedCount = evaluatedList.filter(s => s.binary[qKey]).length;
+      const passPct = Math.round((passedCount / submittedCount) * 100);
+      const tag: 'ง่าย' | 'ปานกลาง' | 'ยาก' = passPct > 70 ? 'ง่าย' : passPct >= 40 ? 'ปานกลาง' : 'ยาก';
       return {
-        id: def.id,
-        label: def.label,
-        passRate: passRatePercent,
-        difficulty: passRatePercent > 70 ? 'easy' : passRatePercent >= 40 ? 'medium' : 'hard'
+        id: qKey,
+        passPct,
+        tag
       };
     });
 
-    return jsonResponse({
-      exerciseId: exId,
-      exerciseName: 'PRISM · FANBOYS · Pretest',
-      classId,
-      summary: {
-        totalStudents,
-        submittedCount,
-        avgScore,
-        passRate,
-        growth: '+3.2'
+    // Score distribution (0-5, 6-10, 11-15, 16-20, 21-25)
+    const scoreDistribution = [
+      { range: '0-5', count: evaluatedList.filter(s => s.rubricTotal <= 5).length },
+      { range: '6-10', count: evaluatedList.filter(s => s.rubricTotal > 5 && s.rubricTotal <= 10).length },
+      { range: '11-15', count: evaluatedList.filter(s => s.rubricTotal > 10 && s.rubricTotal <= 15).length },
+      { range: '16-20', count: evaluatedList.filter(s => s.rubricTotal > 15 && s.rubricTotal <= 20).length },
+      { range: '21-25', count: evaluatedList.filter(s => s.rubricTotal > 20).length }
+    ];
+
+    // Dynamic Pedagogical Insights
+    const insights: Array<{ level: 'red' | 'amber' | 'green'; text: string }> = [];
+    if (carelessCount >= 5) {
+      insights.push({
+        level: 'amber',
+        text: `พบนักเรียน ${carelessCount} คนที่มีสัญญาณ Careless (ผ่านเกณฑ์ประเด็นขั้นต้น q1 แต่หลุดประเด็นลึกซึ้ง q2) แนะนำให้เน้นการตรวจทานรายละเอียด`
+      });
+    }
+    if (luckyCount >= 3) {
+      insights.push({
+        level: 'amber',
+        text: `พบสัญญาณ Lucky ${luckyCount} คน (ผ่านการเชื่อมโยงแต่ไวยากรณ์พื้นฐานยังไม่แน่น) ควรเสริมพื้นฐาน FANBOYS เพิ่มเติม`
+      });
+    }
+    const lowestSkill = [...skills].sort((a, b) => a.avg - b.avg)[0];
+    if (lowestSkill && lowestSkill.avg < 3.0) {
+      insights.push({
+        level: 'red',
+        text: `มิติที่ต้องพัฒนาเร่งด่วน: ${lowestSkill.name} (${lowestSkill.code}) มีคะแนนเฉลี่ยเพียง ${lowestSkill.avg}/5.0`
+      });
+    } else {
+      insights.push({
+        level: 'green',
+        text: `ภาพรวมห้องเรียนผ่านเกณฑ์ระดับมาตรฐาน CbKST ดี มีคะแนนเฉลี่ยรูบริก ${avgRubric}/25.0`
+      });
+    }
+
+    const payload: TeacherReportPayload = {
+      exercise: {
+        id: exId,
+        name: 'PRISM · FANBOYS · Pretest',
+        manifestVersion: '1.0.0'
       },
-      radar,
-      distribution: [
-        { range: '0-5', count: 0 },
-        { range: '6-10', count: evaluatedStudents.filter(s => s.totalScore <= 10).length },
-        { range: '11-15', count: evaluatedStudents.filter(s => s.totalScore > 10 && s.totalScore <= 15).length },
-        { range: '16-20', count: evaluatedStudents.filter(s => s.totalScore > 15 && s.totalScore <= 20).length },
-        { range: '21-25', count: evaluatedStudents.filter(s => s.totalScore > 20).length }
-      ],
+      class: {
+        name: classId,
+        students: totalStudents
+      },
+      asOf: new Date().toISOString().replace('T', ' ').slice(0, 16),
+      stats: {
+        submitted: submittedCount,
+        notSubmitted,
+        avgTot,
+        avgRubric,
+        lucky: luckyCount,
+        careless: carelessCount
+      },
+      knowledgeStates,
+      skills,
       itemDifficulty,
-      students: evaluatedStudents
-    });
+      scoreDistribution,
+      insights,
+      students: evaluatedList.map(s => ({
+        userId: s.id,
+        no: s.no,
+        name: s.name,
+        scores: s.scores,
+        tot: s.binaryTotal,
+        rubricTotal: s.rubricTotal,
+        ks: s.ks,
+        flag: s.flag
+      })),
+      pending: []
+    };
+
+    return jsonResponse(payload);
   }
 
+  // ----------------------------------------------------
   // 9. GET /api/teacher/status/:exId/:classId
+  // ----------------------------------------------------
   if (path.startsWith('teacher/status/')) {
-    if (!currentUser || (currentUser.role !== 'teacher' && currentUser.role !== 'dev')) {
+    if (currentUser.role !== 'teacher' && currentUser.role !== 'dev') {
       return errorResponse('FORBIDDEN', 'เฉพาะครูผู้สอนเท่านั้น', 403);
     }
-    const parts = path.split('/');
-    const classId = decodeURIComponent(parts[3] || 'ม.3/1');
 
-    return jsonResponse([
-      { id: '1', name: 'ด.ช. กฤษณะ วงศ์สวัสดิ์', email: '52001.kritsana@student.nssc.ac.th', class: classId, no: 1, status: 'SUBMITTED', attempt: 1, partsCompleted: 2, totalParts: 2, lastActivityAt: '2026-10-19T10:21:00Z' },
-      { id: '2', name: 'ด.ญ. ชลธิชา สุขเกษม', email: '52002.chonticha@student.nssc.ac.th', class: classId, no: 2, status: 'SUBMITTED', attempt: 1, partsCompleted: 2, totalParts: 2, lastActivityAt: '2026-10-19T10:35:00Z' },
-      { id: '3', name: 'ด.ช. ปัณณธร ศรีสุข', email: '52003.pannatorn@student.nssc.ac.th', class: classId, no: 3, status: 'IN_PROGRESS', attempt: 1, partsCompleted: 1, totalParts: 2, lastActivityAt: '2026-10-20T08:12:00Z' },
-      { id: '4', name: 'ด.ญ. ณัชชา แสงเพชร', email: '52004.natcha@student.nssc.ac.th', class: classId, no: 4, status: 'TODO', attempt: 0, partsCompleted: 0, totalParts: 2, lastActivityAt: null },
-      { id: '5', name: 'ด.ช. ภัทรพล เจริญศิลป์', email: '52005.pattarapol@student.nssc.ac.th', class: classId, no: 5, status: 'SUBMITTED', attempt: 1, partsCompleted: 2, totalParts: 2, lastActivityAt: '2026-10-19T11:04:00Z' }
-    ]);
+    const parts = path.split('/');
+    const classId = decodeURIComponent(parts[3] || '');
+
+    if (currentUser.role === 'teacher' && currentUser.classes && !currentUser.classes.includes(classId)) {
+      return errorResponse('FORBIDDEN', `คุณไม่มีสิทธิ์เข้าถึงข้อมูลของห้อง ${classId}`, 403);
+    }
+
+    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
+    if (!sbRows || sbRows.length === 0) {
+      return errorResponse('NOT_FOUND', `ไม่พบข้อมูลสำหรับห้อง ${classId}`, 404);
+    }
+
+    const classRows = sbRows.filter((r: any) => {
+      const c = String(r.class || r.classroom || '').trim();
+      return c === classId || c === classId.replace('ม.', '');
+    });
+
+    const statusList: TeacherSubmissionStatus[] = classRows.map((r, i) => {
+      const norm = normalizeStudentRow(r, i);
+      return {
+        userId: norm.id,
+        no: norm.no,
+        name: norm.name,
+        status: 'SUBMITTED',
+        partsCompleted: 2,
+        totalParts: 2,
+        lastActivityAt: r.submitted_at || r.created_at || new Date().toISOString()
+      };
+    });
+
+    return jsonResponse(statusList);
   }
 
+  // ----------------------------------------------------
   // 10. GET /api/teacher/student/:exId/:userId
+  // ----------------------------------------------------
   if (path.startsWith('teacher/student/')) {
-    if (!currentUser || (currentUser.role !== 'teacher' && currentUser.role !== 'dev')) {
+    if (currentUser.role !== 'teacher' && currentUser.role !== 'dev') {
       return errorResponse('FORBIDDEN', 'เฉพาะครูผู้สอนเท่านั้น', 403);
     }
+
     const parts = path.split('/');
     const exId = parts[2];
-    const userId = parts[3];
+    const userId = decodeURIComponent(parts[3] || '');
 
-    const studentRecord = DEFAULT_STUDENTS.find(s => s.id === userId) || DEFAULT_STUDENTS[0];
-    const evaluation = evaluateStudentResult(studentRecord.scores);
+    const sbRows = await querySupabase(env, 'writing_assessment_final?select=*');
+    if (!sbRows || sbRows.length === 0) {
+      return errorResponse('NOT_FOUND', 'ไม่พบข้อมูลในระบบ', 404);
+    }
 
-    return jsonResponse({
-      exerciseId: exId,
-      exerciseName: 'PRISM · FANBOYS · Pretest',
-      student: {
-        id: studentRecord.id,
-        name: studentRecord.name,
-        email: studentRecord.email,
-        class: studentRecord.class,
-        no: studentRecord.no
-      },
-      attempt: 1,
-      submittedAt: '2026-10-19T10:21:00Z',
-      ...evaluation
+    const matchedRow = sbRows.find((r: any, idx: number) => {
+      const id = String(r.id || r.student_id || `stu-${idx + 1}`);
+      return id === userId || String(r.no || r.student_number) === userId;
     });
+
+    if (!matchedRow) {
+      return errorResponse('NOT_FOUND', `ไม่พบข้อมูลนักเรียนรหัส ${userId} ในห้องเรียน`, 404);
+    }
+
+    const norm = normalizeStudentRow(matchedRow);
+
+    // Verify teacher ownership of this student's class
+    if (currentUser.role === 'teacher' && currentUser.classes && !currentUser.classes.includes(norm.class)) {
+      return errorResponse('FORBIDDEN', `คุณไม่มีสิทธิ์เข้าถึงข้อมูลของนักเรียนในห้อง ${norm.class}`, 403);
+    }
+
+    const payload: StudentResultPayload = {
+      exercise: {
+        id: exId,
+        name: 'PRISM · FANBOYS · Pretest'
+      },
+      student: {
+        name: norm.name,
+        class: norm.class,
+        no: norm.no
+      },
+      status: 'SUBMITTED',
+      scores: norm.scores,
+      rubricTotal: norm.rubricTotal,
+      binary: norm.binary,
+      binaryTotal: norm.binaryTotal,
+      level: norm.level,
+      ks: norm.ks,
+      flag: norm.flag,
+      badges: norm.badges,
+      feedback: norm.feedback,
+      tips: norm.tips,
+      attempts: {
+        used: 1,
+        max: 1
+      }
+    };
+
+    return jsonResponse(payload);
   }
 
-  // 11. Dev API routes
+  // ----------------------------------------------------
+  // 11. Dev Admin Routes
+  // ----------------------------------------------------
   if (path.startsWith('dev/')) {
-    if (!currentUser || currentUser.role !== 'dev') {
-      return errorResponse('FORBIDDEN', 'เฉพาะผู้ดูแลระบบระบบ (Dev Admin) เท่านั้น', 403);
+    if (currentUser.role !== 'dev') {
+      return errorResponse('FORBIDDEN', 'เฉพาะผู้ดูแลระบบ (Dev Admin) เท่านั้น', 403);
     }
 
     if (path === 'dev/exercises') {
       if (method === 'POST') {
-        const body = (await request.json()) as any;
+        const body = (await request.json().catch(() => ({}))) as any;
         return jsonResponse({ ok: true, id: body.id || 'new-ex', message: 'ลงทะเบียนแบบฝึกสำเร็จ' });
       }
+
       return jsonResponse([
         {
           id: 'prism-fanboys-pretest',
           name: 'PRISM · FANBOYS · Pretest',
-          version: '1.0.0',
+          baseUrl: 'https://prism-fanboys.pages.dev',
+          health: 'healthy',
+          manifestVersion: '1.0.0',
           enabled: true,
-          endpoint: 'https://prism-worker.pages.dev',
-          lastSyncAt: '2026-10-20T08:00:00Z',
-          status: 'HEALTHY'
+          lastSyncAt: new Date().toISOString(),
+          lastError: null,
+          rosterSource: true
         }
       ]);
     }
@@ -499,7 +814,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         ok: true,
         syncedExercises: 1,
         totalSubmissionsSynced: 42,
-        durationMs: 312,
+        durationMs: 280,
         completedAt: new Date().toISOString()
       });
     }
@@ -508,12 +823,11 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       return jsonResponse([
         {
           id: 'log-01',
-          timestamp: new Date().toISOString(),
           exerciseId: 'prism-fanboys-pretest',
-          status: 'SUCCESS',
-          recordsSynced: 42,
-          durationMs: 312,
-          message: 'Incremental sync completed without errors'
+          at: new Date().toISOString(),
+          ok: true,
+          rows: 42,
+          ms: 280
         }
       ]);
     }
@@ -521,7 +835,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     if (path === 'dev/users') {
       return jsonResponse([
         { id: '1', email: 'somkiat.y@nssc.ac.th', name: 'อาจารย์สมเกียรติ ยิ่งเจริญ', role: 'teacher', classes: ['ม.3/1', 'ม.3/2'] },
-        { id: '2', email: 'admin@nssc.ac.th', name: 'System Administrator', role: 'dev' }
+        { id: '2', email: 'admin@nssc.ac.th', name: 'System Administrator', role: 'dev', classes: [] }
       ]);
     }
   }

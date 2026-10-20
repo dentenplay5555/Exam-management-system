@@ -1,17 +1,18 @@
 import React, { useState } from 'react';
 import { authApi } from '../lib/api';
 import { StarfallBackground } from '../components/StarfallBackground';
-import { GraduationCap, UserCheck, Terminal, Globe2, Sparkles, ArrowRight, Shield, AlertCircle, Lock, Database } from 'lucide-react';
+import { GraduationCap, UserCheck, Terminal, Globe2, Sparkles, ArrowRight, Shield, AlertCircle, Lock } from 'lucide-react';
 import type { Role } from '../types';
 
 interface LoginPageProps {
-  onDemoLogin: (role: Role) => void;
-  onOpenSupabaseModal?: () => void;
+  onDemoLogin?: (role: Role) => void;
 }
 
-export const LoginPageNew: React.FC<LoginPageProps> = ({ onDemoLogin, onOpenSupabaseModal }) => {
+export const LoginPageNew: React.FC<LoginPageProps> = ({ onDemoLogin }) => {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const isDevMock = import.meta.env.DEV && import.meta.env.VITE_DEV_MOCK === 'true';
 
   const handleGoogleLogin = () => {
     setLoading(true);
@@ -99,7 +100,7 @@ export const LoginPageNew: React.FC<LoginPageProps> = ({ onDemoLogin, onOpenSupa
               </div>
             )}
 
-            {/* Google Login Button */}
+            {/* Google Login Button (Rule 1) */}
             <button
               onClick={handleGoogleLogin}
               disabled={loading}
@@ -124,133 +125,57 @@ export const LoginPageNew: React.FC<LoginPageProps> = ({ onDemoLogin, onOpenSupa
               )}
             </button>
 
-            <div style={{ textAlign: 'center', fontSize: 12, color: 'var(--text-dim)', marginBottom: 24 }}>
+            <div style={{ textAlign: 'center', fontSize: 12, color: 'var(--text-dim)' }}>
               <Lock size={11} style={{ marginRight: 4, verticalAlign: 'middle' }} />
-              จัดการ session ผ่าน HttpOnly Cookie บน Hub Worker — ข้อมูลไม่ถูกเก็บในเบราว์เซอร์
+              จัดการ session ผ่าน HttpOnly Cookie บน Hub Worker — สิทธิ์จริงตรวจสอบที่ Server
             </div>
 
-            {/* Divider */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
-              <div style={{ flex: 1, height: 1, backgroundColor: 'var(--border-subtle)' }} />
-              <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>หรือทดลองใช้ Demo</span>
-              <div style={{ flex: 1, height: 1, backgroundColor: 'var(--border-subtle)' }} />
-            </div>
+            {/* Dev Mock Mode only if explicitly enabled */}
+            {isDevMock && onDemoLogin && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '24px 0 16px' }}>
+                  <div style={{ flex: 1, height: 1, backgroundColor: 'var(--border-subtle)' }} />
+                  <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>Dev Mode (VITE_DEV_MOCK=true)</span>
+                  <div style={{ flex: 1, height: 1, backgroundColor: 'var(--border-subtle)' }} />
+                </div>
 
-            {/* Demo Login Buttons */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <button
-                onClick={() => onDemoLogin('student')}
-                className="btn-secondary"
-                style={{ width: '100%', padding: '12px 16px', justifyContent: 'flex-start' }}
-              >
-                <div style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: 10,
-                  backgroundColor: 'rgba(56, 189, 248, 0.15)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center'
-                }}>
-                  <GraduationCap size={18} color="var(--accent-cyan)" />
-                </div>
-                <div style={{ textAlign: 'left' }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#fff' }}>
-                    ทดลองเป็น นักเรียน (Student)
-                  </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                    ด.ช. กฤษณะ วงศ์สวัสดิ์ · ม.3/1
-                  </div>
-                </div>
-                <ArrowRight size={14} style={{ marginLeft: 'auto', color: 'var(--text-muted)' }} />
-              </button>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <button
+                    onClick={() => onDemoLogin('student')}
+                    className="btn-secondary"
+                    style={{ width: '100%', padding: '10px 14px', justifyContent: 'flex-start' }}
+                  >
+                    <GraduationCap size={16} color="var(--accent-cyan)" />
+                    <span style={{ fontSize: 12 }}>ทดลองเป็น นักเรียน (Student)</span>
+                    <ArrowRight size={13} style={{ marginLeft: 'auto', color: 'var(--text-muted)' }} />
+                  </button>
 
-              <button
-                onClick={() => onDemoLogin('teacher')}
-                className="btn-secondary"
-                style={{ width: '100%', padding: '12px 16px', justifyContent: 'flex-start' }}
-              >
-                <div style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: 10,
-                  backgroundColor: 'rgba(16, 185, 129, 0.15)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center'
-                }}>
-                  <UserCheck size={18} color="var(--accent-emerald)" />
-                </div>
-                <div style={{ textAlign: 'left' }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#fff' }}>
-                    ทดลองเป็น ครูผู้สอน (Teacher)
-                  </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                    อาจารย์สมเกียรติ ยิ่งเจริญ · ม.3/1-4
-                  </div>
-                </div>
-                <ArrowRight size={14} style={{ marginLeft: 'auto', color: 'var(--text-muted)' }} />
-              </button>
+                  <button
+                    onClick={() => onDemoLogin('teacher')}
+                    className="btn-secondary"
+                    style={{ width: '100%', padding: '10px 14px', justifyContent: 'flex-start' }}
+                  >
+                    <UserCheck size={16} color="var(--accent-emerald)" />
+                    <span style={{ fontSize: 12 }}>ทดลองเป็น ครูผู้สอน (Teacher)</span>
+                    <ArrowRight size={13} style={{ marginLeft: 'auto', color: 'var(--text-muted)' }} />
+                  </button>
 
-              <button
-                onClick={() => onDemoLogin('dev')}
-                className="btn-secondary"
-                style={{ width: '100%', padding: '12px 16px', justifyContent: 'flex-start' }}
-              >
-                <div style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: 10,
-                  backgroundColor: 'rgba(192, 132, 252, 0.15)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center'
-                }}>
-                  <Terminal size={18} color="var(--accent-purple)" />
+                  <button
+                    onClick={() => onDemoLogin('dev')}
+                    className="btn-secondary"
+                    style={{ width: '100%', padding: '10px 14px', justifyContent: 'flex-start' }}
+                  >
+                    <Terminal size={16} color="var(--accent-purple)" />
+                    <span style={{ fontSize: 12 }}>ทดลองเป็น Dev / ผู้ดูแลระบบ</span>
+                    <ArrowRight size={13} style={{ marginLeft: 'auto', color: 'var(--text-muted)' }} />
+                  </button>
                 </div>
-                <div style={{ textAlign: 'left' }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: '#fff' }}>
-                    ทดลองเป็น Dev / ผู้ดูแลระบบ
-                  </div>
-                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                    Admin · เข้าถึง Dev Console ทั้งหมด
-                  </div>
-                </div>
-                <ArrowRight size={14} style={{ marginLeft: 'auto', color: 'var(--text-muted)' }} />
-              </button>
-            </div>
-
-            {onOpenSupabaseModal && (
-              <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border-subtle)', textAlign: 'center' }}>
-                <button
-                  type="button"
-                  onClick={onOpenSupabaseModal}
-                  style={{
-                    background: 'none',
-                    border: '1px solid rgba(16, 185, 129, 0.3)',
-                    backgroundColor: 'rgba(16, 185, 129, 0.08)',
-                    borderRadius: 'var(--radius-md)',
-                    color: 'var(--accent-emerald)',
-                    padding: '8px 16px',
-                    fontSize: 12,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    width: '100%',
-                    justifyContent: 'center'
-                  }}
-                >
-                  <Database size={15} />
-                  <span>เชื่อมต่อฐานข้อมูล Supabase (ดึงข้อมูลจริง)</span>
-                </button>
-              </div>
+              </>
             )}
           </div>
 
           <p style={{ textAlign: 'center', fontSize: 11, color: 'var(--text-dim)' }}>
-            Practice Hub · โรงเรียนนครสวรรค์ · Cloudflare Workers + D1 · 2026
+            Practice Hub · โรงเรียนนครสวรรค์ · Cloudflare Workers Hub API · 2026
           </p>
         </div>
       </div>

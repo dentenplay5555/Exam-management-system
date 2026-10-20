@@ -157,8 +157,8 @@ export const TeacherStudentResultPage: React.FC<TeacherStudentResultPageProps> =
 
       {/* Row 1: Knowledge State & Level Progress */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 20 }}>
-        <KnowledgeStateCard ks={data.ks} flag={data.flag} />
-        <LevelBox level={data.level} />
+        <KnowledgeStateCard ks={data.ks} flag={data.flag} tips={data.tips} />
+        <LevelBox level={data.level} binaryTotal={data.binaryTotal} rubricTotal={data.rubricTotal} />
       </div>
 
       {/* Row 2: Radar Chart & 5 Skills Breakdown */}

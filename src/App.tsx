@@ -1,12 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import type { UserMe, Role } from './types';
-import { authApi, ApiError } from './lib/api';
-import { getSupabaseConfig } from './lib/supabase';
-import { Database } from 'lucide-react';
+import { authApi } from './lib/api';
 
 // Layout
 import { StarfallBackground } from './components/StarfallBackground';
-import { SupabaseSettingsModal } from './components/SupabaseSettingsModal';
 
 // Pages
 import { LoginPageNew } from './pages/LoginPage';
@@ -92,11 +89,9 @@ const Navbar: React.FC<{
   route: Route;
   onNavigate: (r: Route) => void;
   onLogout: () => void;
-  onOpenSupabaseModal: () => void;
-}> = ({ user, route, onNavigate, onLogout, onOpenSupabaseModal }) => {
+}> = ({ user, route, onNavigate, onLogout }) => {
   const roleLabel = user.role === 'student' ? 'นักเรียน' : user.role === 'teacher' ? 'ครูผู้สอน' : 'Dev Admin';
   const roleColor = user.role === 'student' ? 'var(--accent-cyan)' : user.role === 'teacher' ? 'var(--accent-emerald)' : 'var(--accent-purple)';
-  const isSupabaseConfigured = getSupabaseConfig().isConfigured;
 
   return (
     <nav style={{
@@ -140,12 +135,10 @@ const Navbar: React.FC<{
       {/* Nav Links */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, overflowX: 'auto' }}>
         {user.role === 'student' && (
-          <>
-            <NavButton
-              active={route.page === 'student/exercises'}
-              onClick={() => onNavigate({ page: 'student/exercises' })}
-            >งานของฉัน</NavButton>
-          </>
+          <NavButton
+            active={route.page === 'student/exercises'}
+            onClick={() => onNavigate({ page: 'student/exercises' })}
+          >งานของฉัน</NavButton>
         )}
         {(user.role === 'teacher' || user.role === 'dev') && (
           <>
@@ -178,29 +171,8 @@ const Navbar: React.FC<{
         )}
       </div>
 
-      {/* User + Supabase Live Indicator + Logout */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
-        <button
-          onClick={onOpenSupabaseModal}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            fontSize: 12,
-            fontWeight: 600,
-            padding: '5px 11px',
-            borderRadius: 'var(--radius-sm)',
-            border: isSupabaseConfigured ? '1px solid rgba(16, 185, 129, 0.45)' : '1px solid var(--border-subtle)',
-            backgroundColor: isSupabaseConfigured ? 'rgba(16, 185, 129, 0.15)' : 'rgba(255, 255, 255, 0.03)',
-            color: isSupabaseConfigured ? 'var(--accent-emerald)' : 'var(--text-muted)',
-            cursor: 'pointer'
-          }}
-          title={isSupabaseConfigured ? 'เชื่อมต่อฐานข้อมูล Supabase แล้ว (กำลังดึงข้อมูลจริง)' : 'คลิกเพื่อตั้งค่าเชื่อมต่อ Supabase'}
-        >
-          <Database size={13} color={isSupabaseConfigured ? 'var(--accent-emerald)' : 'var(--text-muted)'} />
-          <span>{isSupabaseConfigured ? 'Supabase Live' : 'เชื่อมต่อ DB'}</span>
-        </button>
-
+      {/* User + Logout */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
         <div style={{ textAlign: 'right' }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: '#fff' }}>{user.name}</div>
           <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{user.email}</div>
@@ -343,7 +315,8 @@ export function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [route, setRoute] = useState<Route>({ page: 'login' });
   const [toast, setToast] = useState<string | null>(null);
-  const [showSupabaseModal, setShowSupabaseModal] = useState(false);
+
+  const isDevMock = import.meta.env.DEV && import.meta.env.VITE_DEV_MOCK === 'true';
 
   // On mount: check session from /api/me and sync with browser URL
   useEffect(() => {
@@ -352,19 +325,18 @@ export function App() {
       try {
         const me = await authApi.getMe();
         loggedUser = me;
-      } catch (err) {
-        if (err instanceof ApiError && err.code === 'UNAUTHORIZED') {
-          // Stay on login
-        }
-        const mockRole = localStorage.getItem('practice_hub_mock_role') as Role | null;
-        if (mockRole) {
-          loggedUser = {
-            id: 'mock-usr',
-            name: mockRole === 'student' ? 'ด.ช. กฤษณะ วงศ์สวัสดิ์ (Demo)' : mockRole === 'teacher' ? 'อาจารย์สมเกียรติ ยิ่งเจริญ (Demo)' : 'Dev Admin (Demo)',
-            email: mockRole === 'student' ? 'student@demo.local' : mockRole === 'teacher' ? 'teacher@demo.local' : 'dev@demo.local',
-            role: mockRole,
-            classes: ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4']
-          };
+      } catch {
+        if (isDevMock) {
+          const mockRole = localStorage.getItem('practice_hub_mock_role') as Role | null;
+          if (mockRole) {
+            loggedUser = {
+              id: 'mock-usr',
+              name: mockRole === 'student' ? 'ด.ช. กฤษณะ วงศ์สวัสดิ์ (Dev Mock)' : mockRole === 'teacher' ? 'อาจารย์สมเกียรติ ยิ่งเจริญ (Dev Mock)' : 'Dev Admin (Dev Mock)',
+              email: mockRole === 'student' ? 'student@demo.local' : mockRole === 'teacher' ? 'teacher@demo.local' : 'dev@demo.local',
+              role: mockRole,
+              classes: ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4']
+            };
+          }
         }
       }
 
@@ -385,7 +357,7 @@ export function App() {
         window.history.replaceState(null, '', routeToPath(def));
       }
     })();
-  }, []);
+  }, [isDevMock]);
 
   // Listen to browser Back / Forward buttons
   useEffect(() => {
@@ -399,11 +371,11 @@ export function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  const handleDemoLogin = (role: Role) => {
+  const handleDemoLogin = isDevMock ? (role: Role) => {
     localStorage.setItem('practice_hub_mock_role', role);
     const mockUser: UserMe = {
       id: `mock-${role}`,
-      name: role === 'student' ? 'ด.ช. กฤษณะ วงศ์สวัสดิ์ (Demo)' : role === 'teacher' ? 'อาจารย์สมเกียรติ ยิ่งเจริญ (Demo)' : 'Dev Admin (Demo)',
+      name: role === 'student' ? 'ด.ช. กฤษณะ วงศ์สวัสดิ์ (Dev Mock)' : role === 'teacher' ? 'อาจารย์สมเกียรติ ยิ่งเจริญ (Dev Mock)' : 'Dev Admin (Dev Mock)',
       email: role === 'student' ? 'student@demo.local' : role === 'teacher' ? 'teacher@demo.local' : 'dev@demo.local',
       role,
       classes: ['ม.3/1', 'ม.3/2', 'ม.3/3', 'ม.3/4']
@@ -412,7 +384,7 @@ export function App() {
     const def = defaultRouteForRole(role);
     setRoute(def);
     window.history.pushState(null, '', routeToPath(def));
-  };
+  } : undefined;
 
   const handleLogout = async () => {
     try {
@@ -456,20 +428,7 @@ export function App() {
 
   // Not logged in
   if (!user || route.page === 'login') {
-    return (
-      <>
-        <LoginPageNew onDemoLogin={handleDemoLogin} onOpenSupabaseModal={() => setShowSupabaseModal(true)} />
-        {showSupabaseModal && (
-          <SupabaseSettingsModal
-            onClose={() => setShowSupabaseModal(false)}
-            onRefreshDataFromSupabase={() => {
-              setShowSupabaseModal(false);
-              window.location.reload();
-            }}
-          />
-        )}
-      </>
-    );
+    return <LoginPageNew onDemoLogin={handleDemoLogin} />;
   }
 
   // Forbidden
@@ -478,20 +437,11 @@ export function App() {
       <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
         <StarfallBackground />
         <div style={{ position: 'relative', zIndex: 1 }}>
-          <Navbar user={user} route={route} onNavigate={navigate} onLogout={handleLogout} onOpenSupabaseModal={() => setShowSupabaseModal(true)} />
+          <Navbar user={user} route={route} onNavigate={navigate} onLogout={handleLogout} />
           <main style={{ maxWidth: 1200, margin: '0 auto', padding: '40px 20px' }}>
             <ForbiddenPage onGoBack={() => navigate(defaultRouteForRole(user.role))} />
           </main>
         </div>
-        {showSupabaseModal && (
-          <SupabaseSettingsModal
-            onClose={() => setShowSupabaseModal(false)}
-            onRefreshDataFromSupabase={() => {
-              setShowSupabaseModal(false);
-              window.location.reload();
-            }}
-          />
-        )}
       </div>
     );
   }
@@ -502,20 +452,11 @@ export function App() {
       <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
         <StarfallBackground />
         <div style={{ position: 'relative', zIndex: 1 }}>
-          <Navbar user={user} route={route} onNavigate={navigate} onLogout={handleLogout} onOpenSupabaseModal={() => setShowSupabaseModal(true)} />
+          <Navbar user={user} route={route} onNavigate={navigate} onLogout={handleLogout} />
           <main style={{ maxWidth: 1200, margin: '0 auto', padding: '40px 20px' }}>
             <ForbiddenPage onGoBack={() => navigate(defaultRouteForRole(user.role))} />
           </main>
         </div>
-        {showSupabaseModal && (
-          <SupabaseSettingsModal
-            onClose={() => setShowSupabaseModal(false)}
-            onRefreshDataFromSupabase={() => {
-              setShowSupabaseModal(false);
-              window.location.reload();
-            }}
-          />
-        )}
       </div>
     );
   }
@@ -611,7 +552,6 @@ export function App() {
           route={route}
           onNavigate={navigate}
           onLogout={handleLogout}
-          onOpenSupabaseModal={() => setShowSupabaseModal(true)}
         />
 
         <main style={{ flex: 1, maxWidth: 1200, width: '100%', margin: '0 auto', padding: '32px 20px' }}>
@@ -629,17 +569,6 @@ export function App() {
           Practice Hub · PRISM CbKST Diagnostic Framework · โรงเรียนนครสวรรค์ · Cloudflare Workers D1 · 2026
         </footer>
       </div>
-
-      {/* Supabase Settings & Connection Modal */}
-      {showSupabaseModal && (
-        <SupabaseSettingsModal
-          onClose={() => setShowSupabaseModal(false)}
-          onRefreshDataFromSupabase={() => {
-            setShowSupabaseModal(false);
-            window.location.reload();
-          }}
-        />
-      )}
 
       {/* Toast Notification */}
       {toast && (

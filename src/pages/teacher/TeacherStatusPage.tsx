@@ -16,6 +16,7 @@ export const TeacherStatusPage: React.FC<TeacherStatusPageProps> = ({ exId, clas
   const [list, setList] = useState<TeacherSubmissionStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'SUBMITTED' | 'PENDING'>('ALL');
 
   const fetchStatus = async () => {
     setLoading(true);
@@ -46,8 +47,6 @@ export const TeacherStatusPage: React.FC<TeacherStatusPageProps> = ({ exId, clas
   if (error) {
     return <ErrorState message={error} onRetry={fetchStatus} />;
   }
-
-  const [statusFilter, setStatusFilter] = useState<'ALL' | 'SUBMITTED' | 'PENDING'>('ALL');
 
   const submittedCount = list.filter(s => s.status === 'SUBMITTED' || s.status === 'COMPLETED').length;
   const pendingCount = list.length - submittedCount;

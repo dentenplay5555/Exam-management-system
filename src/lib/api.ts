@@ -9,13 +9,8 @@ import type {
   TeacherReportPayload,
   TeacherSubmissionStatus,
   DevExerciseItem,
-  SyncLogItem,
-  AuditLogItem,
   DevUserItem
 } from '../types';
-
-import { getSupabaseConfig, fetchStudentsFromSupabase } from './supabase';
-import type { StudentRecord } from '../types';
 
 export class ApiError extends Error {
   code: string;
@@ -53,218 +48,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     return json as T;
   } catch (err: any) {
     if (err instanceof ApiError) throw err;
-    // Check if user has Supabase configured to load real data
-    return await getFallbackWithSupabase<T>(path, options);
-  }
-}
 
-async function getFallbackWithSupabase<T>(path: string, options: RequestInit): Promise<T> {
-  const { isConfigured } = getSupabaseConfig();
-  if (isConfigured) {
-    try {
-      const { ok, students } = await fetchStudentsFromSupabase();
-      if (ok && students && students.length > 0) {
-        const live = mapSupabaseToApi<T>(path, students);
-        if (live !== null) return live;
-      }
-    } catch (e) {
-      console.warn('Supabase fetch failed, falling back to mock schema:', e);
+    // Only allow mock fallback if explicitly enabled in development (VITE_DEV_MOCK=true)
+    const isExplicitDevMock = import.meta.env.DEV && import.meta.env.VITE_DEV_MOCK === 'true';
+    if (isExplicitDevMock) {
+      return getMockFallback<T>(path, options);
     }
+
+    throw new ApiError('NETWORK_ERROR', err.message || 'ไม่สามารถติดต่อเซิร์ฟเวอร์ Hub API ได้');
   }
-  return getMockFallback<T>(path, options);
-}
-
-function mapSupabaseToApi<T>(path: string, students: StudentRecord[]): T | null {
-  // 1. Teacher classes
-  if (path === '/teacher/classes') {
-    const classes = Array.from(new Set(students.map(s => s.classRoom))).filter(Boolean);
-    return (classes.length ? classes : ['ม.3/1']) as T;
-  }
-
-  // 2. Teacher Report
-  if (path.startsWith('/teacher/report/')) {
-    const parts = path.split('/');
-    const exId = parts[3] || 'prism-fanboys-pretest';
-    const classId = decodeURIComponent(parts[4] || '');
-
-    const classStudents = classId ? students.filter(s => s.classRoom === classId) : students;
-    const list = classStudents.length ? classStudents : students;
-
-    const submitted = list.filter(s => s.status === 'SUBMITTED' || s.status === 'COMPLETED');
-    const notSubmitted = list.length - submitted.length;
-    const lucky = list.filter(s => s.flag === 'Lucky').length;
-    const careless = list.filter(s => s.flag === 'Careless').length;
-
-    const avgTot = submitted.length
-      ? +(submitted.reduce((sum, s) => sum + s.totScore, 0) / submitted.length).toFixed(1)
-      : 0;
-    const avgRubric = submitted.length
-      ? +(submitted.reduce((sum, s) => sum + s.rubricTotal, 0) / submitted.length).toFixed(1)
-      : 0;
-
-    const ksMap: Record<string, number> = { 'Mastery': 0, 'Language Dev': 0, 'Structure OK': 0, 'Beginner': 0 };
-    list.forEach(s => {
-      const k = s.knowledgeState || 'Beginner';
-      ksMap[k] = (ksMap[k] || 0) + 1;
-    });
-    const total = list.length || 1;
-    const knowledgeStates = [
-      { name: 'Mastery', count: ksMap['Mastery'], pct: Math.round((ksMap['Mastery'] / total) * 100) },
-      { name: 'Language Dev', count: ksMap['Language Dev'], pct: Math.round((ksMap['Language Dev'] / total) * 100) },
-      { name: 'Structure OK', count: ksMap['Structure OK'], pct: Math.round((ksMap['Structure OK'] / total) * 100) },
-      { name: 'Beginner', count: ksMap['Beginner'], pct: Math.round((ksMap['Beginner'] / total) * 100) }
-    ];
-
-    const skillCodes = ['TR', 'ME', 'LR', 'GRA', 'CC'] as const;
-    const skillNames = {
-      TR: 'Task Response',
-      ME: 'Mechanics',
-      LR: 'Lexical Resource',
-      GRA: 'Grammar & Accuracy',
-      CC: 'Coherence & Cohesion'
-    };
-    const skills = skillCodes.map(code => {
-      const sum = list.reduce((acc, s) => acc + (s.scores[code] || 0), 0);
-      const avg = +(sum / total).toFixed(1);
-      const passCount = list.filter(s => (s.scores[code] || 0) >= 3).length;
-      return {
-        code,
-        name: skillNames[code],
-        passPct: Math.round((passCount / total) * 100),
-        avg
-      };
-    });
-
-    const scoreDistribution = [
-      { range: '0-5', count: list.filter(s => s.rubricTotal <= 5).length },
-      { range: '6-10', count: list.filter(s => s.rubricTotal >= 6 && s.rubricTotal <= 10).length },
-      { range: '11-15', count: list.filter(s => s.rubricTotal >= 11 && s.rubricTotal <= 15).length },
-      { range: '16-20', count: list.filter(s => s.rubricTotal >= 16 && s.rubricTotal <= 20).length },
-      { range: '21-25', count: list.filter(s => s.rubricTotal >= 21).length }
-    ];
-
-    return {
-      exercise: { id: exId, name: 'PRISM · FANBOYS (Supabase Live)', manifestVersion: '1.2.0' },
-      class: { name: classId || list[0]?.classRoom || 'ม.3/1', students: list.length },
-      asOf: `Supabase Live: ${new Date().toLocaleTimeString('th-TH')}`,
-      stats: {
-        submitted: submitted.length,
-        notSubmitted,
-        avgTot,
-        avgRubric,
-        lucky,
-        careless
-      },
-      knowledgeStates,
-      skills,
-      itemDifficulty: [
-        { id: 'q1', passPct: Math.round((list.filter(s => s.scores.TR >= 3).length / total) * 100), tag: 'ง่าย' },
-        { id: 'q2', passPct: Math.round((list.filter(s => s.scores.TR >= 4).length / total) * 100), tag: 'ปานกลาง' },
-        { id: 'q3', passPct: Math.round((list.filter(s => s.scores.ME >= 3).length / total) * 100), tag: 'ง่าย' },
-        { id: 'q4', passPct: Math.round((list.filter(s => s.scores.ME >= 4).length / total) * 100), tag: 'ง่าย' },
-        { id: 'q5', passPct: Math.round((list.filter(s => s.scores.LR >= 3).length / total) * 100), tag: 'ปานกลาง' },
-        { id: 'q6', passPct: Math.round((list.filter(s => s.scores.LR >= 4).length / total) * 100), tag: 'ปานกลาง' },
-        { id: 'q7', passPct: Math.round((list.filter(s => s.scores.GRA >= 4).length / total) * 100), tag: 'ยาก' },
-        { id: 'q8', passPct: Math.round((list.filter(s => s.scores.CC >= 3).length / total) * 100), tag: 'ง่าย' },
-        { id: 'q9', passPct: Math.round((list.filter(s => s.scores.CC >= 4).length / total) * 100), tag: 'ยาก' }
-      ],
-      scoreDistribution,
-      insights: [
-        { level: 'green', text: `ดึงข้อมูลนักเรียนจริงจาก Supabase สำเร็จ (${list.length} คน)` },
-        ...(careless > 0 ? [{ level: 'amber' as const, text: `พบสัญญาณ Careless ${careless} คนในข้อมูลจริง` }] : []),
-        ...(lucky > 0 ? [{ level: 'red' as const, text: `พบสัญญาณ Lucky ${lucky} คนที่ต้องสังเกต` }] : [])
-      ],
-      students: list.map(s => ({
-        userId: s.id,
-        no: s.studentNumber,
-        name: s.fullName,
-        scores: s.scores,
-        tot: s.totScore,
-        rubricTotal: s.rubricTotal,
-        ks: s.knowledgeState,
-        flag: s.flag
-      })),
-      pending: list.filter(s => s.status === 'TODO' || s.status === 'IN_PROGRESS').map(s => ({
-        no: s.studentNumber,
-        name: s.fullName
-      }))
-    } as T;
-  }
-
-  // 3. Teacher Status
-  if (path.startsWith('/teacher/status/')) {
-    const parts = path.split('/');
-    const classId = decodeURIComponent(parts[4] || '');
-    const list = classId ? students.filter(s => s.classRoom === classId) : students;
-    return list.map(s => ({
-      userId: s.id,
-      no: s.studentNumber,
-      name: s.fullName,
-      status: s.status,
-      partsCompleted: s.status === 'SUBMITTED' || s.status === 'COMPLETED' ? 3 : s.status === 'IN_PROGRESS' ? 1 : 0,
-      totalParts: 3,
-      lastActivityAt: s.lastActivityAt ? new Date(s.lastActivityAt).toLocaleDateString('th-TH') : '-'
-    })) as T;
-  }
-
-  // 4. Student Result (or Teacher viewing specific Student)
-  if (path.startsWith('/teacher/student/') || path.startsWith('/student/results/')) {
-    const parts = path.split('/');
-    const targetId = path.startsWith('/teacher/student/') ? parts[4] : '';
-    const student = (targetId ? students.find(s => s.id === targetId) : null) || students[0];
-    if (student) {
-      return {
-        exercise: { id: 'prism-fanboys-pretest', name: 'PRISM · FANBOYS · Pretest' },
-        student: { name: student.fullName, class: student.classRoom, no: student.studentNumber },
-        status: student.status,
-        scores: student.scores,
-        rubricTotal: student.rubricTotal,
-        binary: {
-          q1: student.scores.TR >= 3,
-          q2: student.scores.TR >= 4,
-          q3: student.scores.ME >= 3,
-          q4: student.scores.ME >= 4,
-          q5: student.scores.LR >= 3,
-          q6: student.scores.LR >= 4,
-          q7: student.scores.GRA >= 4,
-          q8: student.scores.CC >= 3,
-          q9: student.scores.CC >= 4
-        },
-        binaryTotal: student.totScore,
-        level: { n: student.level.rank, name: student.level.name, xp: student.level.xp },
-        ks: student.knowledgeState,
-        flag: student.flag,
-        badges: student.badges.map(b => ({ id: b.id, name: b.title, earned: b.unlocked, desc: b.desc })),
-        feedback: {
-          TR: student.scores.TR >= 4 ? 'ตอบตรงประเด็นและขยายความได้ลึกซึ้ง' : 'ควรอ่านคำถามให้รอบคอบและจัดลำดับความคิดหลัก',
-          ME: student.scores.ME >= 4 ? 'เครื่องหมายวรรคตอนและการสะกดคำแม่นยำ' : 'ระวังการใช้ Comma Splice และตัวสะกด',
-          LR: student.scores.LR >= 4 ? 'คลังคำศัพท์หลากหลายและเป็นธรรมชาติ' : 'เลือกใช้คำศัพท์สื่อความหมายให้เหมาะสม',
-          GRA: student.scores.GRA >= 4 ? 'โครงสร้างประโยค Compound ถูกต้อง' : 'ระวังเรื่อง Subject-Verb Agreement',
-          CC: student.scores.CC >= 4 ? 'เชื่อมประโยค FANBOYS ได้ลื่นไหล' : 'ระวังการเขียนประโยคเดี่ยวๆ โดยขาดคำเชื่อม'
-        },
-        tips: student.teacherNotes ? [student.teacherNotes] : ['ฝึกฝนการเขียนเชื่อมประโยคภาษาอังกฤษอย่างสม่ำเสมอ'],
-        attempts: { used: student.status === 'SUBMITTED' ? 1 : 0, max: 2 }
-      } as T;
-    }
-  }
-
-  // 5. Dev Users
-  if (path === '/dev/users') {
-    const teacherClasses = Array.from(new Set(students.map(s => s.classRoom))).filter(Boolean);
-    return [
-      { id: 'usr-teacher-1', name: 'อาจารย์สมเกียรติ ยิ่งเจริญ', email: 'somkiat@nssc.ac.th', role: 'teacher', classes: teacherClasses },
-      { id: 'usr-dev-1', name: 'Admin ผู้ดูแลระบบ', email: 'admin@nssc.ac.th', role: 'dev', classes: [] },
-      ...students.map(s => ({
-        id: s.id,
-        name: s.fullName,
-        email: s.email,
-        role: 'student' as const,
-        classes: [s.classRoom]
-      }))
-    ] as T;
-  }
-
-  return null;
 }
 
 // 1. Auth API
